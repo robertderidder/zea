@@ -39,6 +39,41 @@ from zea.models.utils import LossTrackerWrapper
 
 tf = _import_tf()
 
+import matplotlib.pyplot as plt
+import numpy as np
+
+def save_diffusion_frame(step, noisy_img, pred_img, signal_rates, noise_rates):
+    fig, axs = plt.subplots(2, 2, figsize=(20, 20))
+    
+    # 1. Top Left: Current Noisy Image (B&W)
+    axs[0, 0].imshow(np.array(noisy_img[0]), cmap='gray')
+    axs[0, 0].set_title(f"Noisy (Step {step})")
+    axs[0, 0].axis('off')
+    axs[0, 0].title('Noisy image')
+
+    # 2. Top Right: Predicted Image (B&W)
+    axs[0, 1].imshow(np.array(pred_img[0]), cmap='gray')
+    axs[0, 1].set_title("Predicted Image")
+    axs[0, 1].axis('off')
+    axs[0, 1].title('Predicted image')
+
+    # 3. Bottom Left: Signal Strength Plot
+    axs[1, 0].plot(signal_rates, color='blue')
+    axs[1, 0].set_title("Signal Strength Over Time")
+    axs[1, 0].set_xlabel("Step")
+    axs[1, 0].set_ylabel("Rate")
+    axs[1, 0].grid(True)
+    axs[1, 0].title('Signal strength')
+
+    # 4. Bottom Right: Noise Rate Plot (or keep empty/info)
+    axs[1, 1].plot(noise_rates, color='red')
+    axs[1, 1].set_title("Noise Rate")
+    axs[1, 1].grid(True)
+    axs[1, 1].title(('Noise strength'))
+
+    plt.tight_layout()
+    plt.savefig(f"diffusion_t={step:03d}.png")
+    plt.close(fig)
 
 @model_registry(name="diffusion")
 class DiffusionModel(DeepGenerativeModel):
@@ -511,6 +546,7 @@ class DiffusionModel(DeepGenerativeModel):
         disable_jit: bool = False,
         training: bool = False,
         network_type: Literal[None, "main", "ema"] = None,
+        create_gif: bool = False,
     ):
         """Reverse diffusion process to generate images from noise.
 
@@ -544,7 +580,9 @@ class DiffusionModel(DeepGenerativeModel):
             initial_samples,
             initial_step,
             step_size,
-        )
+)
+        signal_rate = []
+        noise_rate = []
 
         def step_fn(step, loop_state):
             noisy_images, pred_images, seed = loop_state
@@ -593,6 +631,20 @@ class DiffusionModel(DeepGenerativeModel):
             self.store_progress(step, track_progress_type, next_noisy_images, pred_images)
 
             loop_state = (next_noisy_images, pred_images, seed)
+
+            # --- ADDED FOR GIF GENERATION ---
+            # We use ops.convert_to_numpy or np.array depending on backend
+            if create_gif:
+                signal_rate.append(next_signal_rates)
+                noise_rate.append(next_noise_rates)
+                save_diffusion_frame(
+                    step, 
+                    next_noisy_images, 
+                    pred_images, 
+                    signal_rate, 
+                    noise_rate
+                )
+                # --------------------------------
 
             return loop_state
 
