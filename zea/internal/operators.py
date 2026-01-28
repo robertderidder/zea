@@ -196,3 +196,77 @@ class FourierBlurOperator(Operator):
 
     def __str__(self):
         return f"y = F^(-1)(M * F(x)) filter at {self.cutoff_freq}"
+
+
+from zea.simulator import simulate_rf
+
+@operator_registry(name="simulate")
+class SimulateOperator(Operator):
+    """
+    Operator for simulating RF data from an image.
+    The operator is initialized with fixed scan and probe parameters.
+    The forward operation takes an image, computes scatterer positions and magnitudes,
+    and simulates the RF data using the ultrasound simulator.
+    """
+
+    def __init__(self, scan, probe, shape):
+        super().__init__()
+        self.scan = scan
+        self.probe = probe
+        self.shape = shape
+        self.positions = self.compute_scatterer_positions()
+
+    def compute_scatterer_positions(self):
+        """
+        Compute scatterer positions for each pixel in the image, using scan x/z limits and image shape.
+        Returns an array of shape (n_pixels, 3) with [x, y, z] positions.
+        """
+        x_start, x_end = self.scan.xlims
+        z_start, z_end = self.scan.zlims
+        # Accept (H, W), (H, W, C) or (B, H, W, C)
+        if len(self.shape) == 2:
+            H, W = self.shape
+        elif len(self.shape) >= 3:
+            H, W = self.shape[-3], self.shape[-2]
+        else:
+            raise ValueError(f"Invalid shape {self.shape}. Expected (H, W), (H, W, C), or (B, H, W, C).")
+        x = ops.linspace(x_start, x_end, H)
+        z = ops.linspace(z_start, z_end, W)
+        xv, zv = ops.meshgrid(x, z, indexing='ij')
+        x_flat = ops.reshape(xv, [-1])
+        z_flat = ops.reshape(zv, [-1])
+        y_flat = ops.zeros_like(x_flat)
+        positions = ops.stack([x_flat, y_flat, z_flat], axis=1)
+        return positions
+
+    def forward(self, image):
+        """
+        Simulates RF data from the input image.
+        Each pixel is a scatterer, pixel value is magnitude.
+        """
+        magnitudes = ops.reshape(image, [-1])
+        rf_data = simulate_rf(
+            scatterer_positions=self.positions,
+            scatterer_magnitudes=magnitudes,
+            probe_geometry=self.probe.probe_geometry,
+            apply_lens_correction=self.scan.apply_lens_correction,
+            lens_thickness=1e-9,
+            lens_sound_speed=1000,
+            sound_speed=self.scan.sound_speed,
+            n_ax=self.scan.n_ax,
+            center_frequency=self.probe.center_frequency,
+            sampling_frequency=self.probe.sampling_frequency,
+            t0_delays=self.scan.t0_delays,
+            initial_times=self.scan.initial_times,
+            element_width=self.scan.element_width,
+            attenuation_coef=self.scan.attenuation_coef,
+            tx_apodizations=self.scan.tx_apodizations
+        )
+        return rf_data
+
+    def transpose(self, data):
+        raise NotImplementedError("Transpose for SimulateOperator is not implemented.")
+
+    def __str__(self):
+        return f"SimulateOperator with scan n_tx={self.scan.n_tx}, probe center_freq={self.probe.center_frequency}"
+    
