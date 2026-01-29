@@ -8,6 +8,8 @@ import abc
 
 import numpy as np
 from keras import ops
+import jax
+import jax.numpy as jnp
 
 from zea.internal.core import Object
 from zea.internal.registry import operator_registry
@@ -199,6 +201,7 @@ class FourierBlurOperator(Operator):
 
 
 from zea.simulator import simulate_rf
+from zea.func.tensor import fori_loop
 
 @operator_registry(name="simulate")
 class SimulateOperator(Operator):
@@ -209,12 +212,13 @@ class SimulateOperator(Operator):
     and simulates the RF data using the ultrasound simulator.
     """
 
-    def __init__(self, scan, probe, shape):
+    def __init__(self, scan, probe, shape, chunk_size = 1024):
         super().__init__()
         self.scan = scan
         self.probe = probe
         self.shape = shape
         self.positions = self.compute_scatterer_positions()
+        self.chunk_size = chunk_size
 
     def compute_scatterer_positions(self):
         """
@@ -238,32 +242,72 @@ class SimulateOperator(Operator):
         y_flat = ops.zeros_like(x_flat)
         positions = ops.stack([x_flat, y_flat, z_flat], axis=1)
         return positions
-
+    
     def forward(self, image):
         """
         Simulates RF data from the input image.
         Each pixel is a scatterer, pixel value is magnitude.
         """
-        magnitudes = ops.reshape(image, [-1])
-        rf_data = simulate_rf(
-            scatterer_positions=self.positions,
-            scatterer_magnitudes=magnitudes,
-            probe_geometry=self.probe.probe_geometry,
-            apply_lens_correction=self.scan.apply_lens_correction,
-            lens_thickness=1e-9,
-            lens_sound_speed=1000,
-            sound_speed=self.scan.sound_speed,
-            n_ax=self.scan.n_ax,
-            center_frequency=self.probe.center_frequency,
-            sampling_frequency=self.probe.sampling_frequency,
-            t0_delays=self.scan.t0_delays,
-            initial_times=self.scan.initial_times,
-            element_width=self.scan.element_width,
-            attenuation_coef=self.scan.attenuation_coef,
-            tx_apodizations=self.scan.tx_apodizations
-        )
-        return rf_data
+        n_frames, *img_shape = image.shape
+        magnitudes = ops.reshape(image, (n_frames, -1))
+        @jax.checkpoint
+        def simulate_chunk_fn(chunk_positions, chunk_magnitudes):
+            return simulate_rf(
+                scatterer_positions=chunk_positions,
+                scatterer_magnitudes=chunk_magnitudes,
+                probe_geometry=self.probe.probe_geometry,
+                apply_lens_correction=self.scan.apply_lens_correction,
+                lens_thickness=self.scan.lens_thickness,
+                lens_sound_speed=self.scan.lens_sound_speed,
+                sound_speed=self.scan.sound_speed,
+                n_ax=self.scan.n_ax,
+                center_frequency=self.probe.center_frequency,
+                sampling_frequency=self.probe.sampling_frequency,
+                t0_delays=self.scan.t0_delays,
+                initial_times=self.scan.initial_times,
+                element_width=self.scan.element_width,
+                attenuation_coef=self.scan.attenuation_coef,
+                tx_apodizations=self.scan.tx_apodizations,
+            )
+        
+        n_scatterers = self.positions.shape[0]
+        n_chunks = n_scatterers // self.chunk_size
 
+        # 2. Reshape into chunks: (N_chunks, chunk_size, ...)
+        # Note: This assumes n_scatterers is divisible by self.chunk_size. 
+        # If not, pad self.positions and magnitudes with zeros.
+        n_chunks = n_scatterers // self.chunk_size
+        remainder = n_scatterers % self.chunk_size
+        if remainder == 0:
+            n_padded = n_scatterers
+            pad_width = 0
+        else:
+            pad_width = self.chunk_size-remainder
+            n_padded = n_scatterers+pad_width
+
+        padded_pos = jnp.pad(self.positions, ((0, pad_width), (0, 0)))
+        padded_mag = jnp.pad(magnitudes, ((0, 0), (0, pad_width)))
+
+        n_chunks = n_padded // self.chunk_size
+        reshaped_pos = ops.reshape(padded_pos, (n_chunks, self.chunk_size, 3))
+        reshaped_mag = ops.reshape(padded_mag, (n_frames, n_chunks, self.chunk_size))
+        reshaped_mag = jnp.swapaxes(reshaped_mag, 0, 1)
+
+        # 3. Define the scan carrier function
+        def body_fn(carry, x):
+            pos_c, mag_c = x
+            # vmap over the n_frames dimension
+            rf_chunk = jax.vmap(simulate_chunk_fn, in_axes=(None, 0))(pos_c, mag_c)
+            return carry + rf_chunk, None
+
+        # 4. Initialize total_rf and run the loop
+        # You need to know the output shape of simulate_rf (e.g., [n_samples, n_channels])
+        out_shape = (n_frames, 1, self.scan.n_tx, self.scan.n_el, self.scan.n_ax, 1) # adjust accordingly
+        init_rf = jnp.zeros(out_shape)
+        
+        total_rf, _ = jax.lax.scan(body_fn, init_rf, (reshaped_pos, reshaped_mag))
+        return total_rf
+    
     def transpose(self, data):
         raise NotImplementedError("Transpose for SimulateOperator is not implemented.")
 
