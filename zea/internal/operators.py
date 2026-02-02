@@ -201,9 +201,8 @@ class FourierBlurOperator(Operator):
 
 
 from zea.simulator import simulate_rf
-from zea.func.tensor import fori_loop
 
-@operator_registry(name="simulate")
+@operator_registry(name="simulate_zea")
 class SimulateOperator(Operator):
     """
     Operator for simulating RF data from an image.
@@ -313,4 +312,79 @@ class SimulateOperator(Operator):
 
     def __str__(self):
         return f"SimulateOperator with scan n_tx={self.scan.n_tx}, probe center_freq={self.probe.center_frequency}"
+    
+from jaxus.rf_simulator import _get_vectorized_simulate_function
+from jaxus.rf_simulator import simulate_rf_data
+from jaxus.containers.waveform import get_pulse
+
+
+@operator_registry(name="simulator_full")
+class SimulatorFull(Operator):
+    """
+    Operator for simulating RF data from an image.
+    The operator is initialized with fixed scan and probe parameters.
+    The forward operation takes an image, computes scatterer positions and magnitudes,
+    and simulates the RF data using the ultrasound simulator.
+    """
+
+    def __init__(self, scan, shape):
+        super().__init__()
+        self.scan = scan
+        self.shape = shape
+        self.positions = self.compute_scatterer_positions()
+
+    def compute_scatterer_positions(self):
+        """
+        Compute scatterer positions for each pixel in the image, using scan x/z limits and image shape.
+        Returns an array of shape (n_pixels, 3) with [x, y, z] positions.
+        """
+        x_start, x_end = self.scan.xlims
+        z_start, z_end = self.scan.zlims
+        # Accept (H, W), (H, W, C) or (B, H, W, C)
+        if len(self.shape) == 2:
+            H, W = self.shape
+        elif len(self.shape) >= 3:
+            H, W = self.shape[-3], self.shape[-2]
+        else:
+            raise ValueError(f"Invalid shape {self.shape}. Expected (H, W), (H, W, C), or (B, H, W, C).")
+        x = ops.linspace(x_start, x_end, H)
+        z = ops.linspace(z_start, z_end, W)
+        xv, zv = ops.meshgrid(x, z, indexing='ij')
+        x_flat = ops.reshape(xv, [-1])
+        z_flat = ops.reshape(zv, [-1])
+        y_flat = ops.zeros_like(x_flat)
+        positions = ops.stack([x_flat, y_flat, z_flat], axis=1)
+        return positions
+    
+    def forward(self, image):
+        """
+        Simulates RF data from the input image.
+        Each pixel is a scatterer, pixel value is magnitude.
+        """
+        assert len(image.shape)==4, f"Image should be of shape [n_frames, H, W, 1] but got {image.shape}"
+        n_frames, *img_shape = image.shape
+        magnitudes = ops.reshape(image, (n_frames, -1))[0] #e.g. [17, 12544] --> (12544,)
+        element_angles = jnp.zeros(self.scan.n_el)
+
+        rf_data = simulate_rf_data(
+            n_ax = self.scan.n_ax,
+            scatterer_positions = self.positions[...,[0,2]],
+            scatterer_amplitudes = magnitudes,
+            t0_delays = self.scan.t0_delays,
+            probe_geometry = self.scan.probe_geometry[...,[0,2]],
+            element_angles = element_angles,
+            tx_apodizations = self.scan.tx_apodizations,
+            initial_times = self.scan.initial_times,
+            element_width_wl = self.scan.element_width,
+            sampling_frequency = self.scan.sampling_frequency,
+            carrier_frequency = self.scan.center_frequency,
+            sound_speed = self.scan.sound_speed,
+        )
+        return rf_data
+    
+    def transpose(self, data):
+        raise NotImplementedError("Transpose for SimulateOperatorJaxus is not implemented.")
+
+    def __str__(self):
+        return f"SimulateOperator implemented in jax with scan n_tx={self.scan.n_tx}, probe center_freq={self.probe.center_frequency}"
     
