@@ -312,11 +312,8 @@ class ZeaSimulatorOperator(Operator):
 
     def __str__(self):
         return f"SimulateOperator with scan n_tx={self.scan.n_tx}, probe center_freq={self.probe.center_frequency}"
-    
-from jaxus.rf_simulator import _get_vectorized_simulate_function
-from jaxus.rf_simulator import simulate_rf_data
-from jaxus.containers.waveform import get_pulse
 
+from jaxus.rf_simulator import simulate_rf_data
 
 @operator_registry(name="simulator_full")
 class SimulatorFull(Operator):
@@ -430,26 +427,31 @@ class SimulatorPartial(Operator):
         positions = ops.stack([x_flat, y_flat, z_flat], axis=1)
         return positions
     
-    def forward(self, image):
+    # def magnitude_from_image(self, image_log):
+    #     image_lin = 10 ** (image_log / 20)
+
+    def forward(self, image, n_points):
         """
         Simulates RF data from the input image.
         Each pixel is a scatterer, pixel value is magnitude.
         """
         assert len(image.shape)==4, f"Image should be of shape [n_frames, H, W, 1] but got {image.shape}"
+        assert n_points <= self.scan.n_el * self.scan.n_ax, f"n_points can at maximum be n_ax*n_el = {self.scan.n_ax}*{self.scan.n_el}={self.scan.n_ax*self.scan.n_el} but got {n_points}"
         n_frames, *img_shape = image.shape
-        magnitudes = ops.reshape(image, (n_frames, -1))[0] #e.g. [17, 12544] --> (12544,)
-        element_angles = jnp.zeros(self.scan.n_el)
+        magnitudes = ops.reshape(image, (n_frames, -1))[0] #e.g. [17, 12544] --> (12544,) # TODO expand to more than 1 image
+        
+        total_pixels = self.scan.n_ax * self.scan.n_el
 
-        ax_indices = jnp.array([512, 700, 40])  # 3 axial indices
-        el_indices = jnp.array([50, 80, 90])    # 3 element indices
+        key = jax.random.PRNGKey(42) # Use your seed here
+        flat_indices = jax.random.choice(key, total_pixels, shape=(n_points,), replace=False)
+        ax_indices, el_indices = jnp.unravel_index(flat_indices, (self.scan.n_ax, self.scan.n_el))
 
         rf_data = simulate_partial_rf_data(
-            n_ax = self.scan.n_ax,
             scatterer_positions = self.positions[...,[0,2]],
             scatterer_amplitudes = magnitudes,
             t0_delays = self.scan.t0_delays,
             probe_geometry = self.scan.probe_geometry[...,[0,2]],
-            element_angles = element_angles,
+            element_angles = jnp.zeros(self.scan.n_el),
             tx_apodizations = self.scan.tx_apodizations,
             initial_times = self.scan.initial_times,
             element_width_wl = self.scan.element_width,
@@ -458,7 +460,7 @@ class SimulatorPartial(Operator):
             ax_indices = ax_indices,
             el_indices = el_indices
         )
-        return rf_data
+        return rf_data, ax_indices, el_indices
     
     def transpose(self):
         raise NotImplementedError("Transpose for SimulateOperatorJaxus is not implemented.")
@@ -466,16 +468,16 @@ class SimulatorPartial(Operator):
     def __str__(self):
         return f"SimulateOperator implemented in jax with scan n_tx={self.scan.n_tx}, probe center_freq={self.probe.center_frequency}"
 
-from infer.simulate import (
-    ForwardSettings,
-    OptVars,
-    inverse_reparameterize_opt_vars,
-    inverse_reparameterize_scat_amp,
-    inverse_reparameterize_scat_pos,
-    reparameterize_opt_vars,
-    reparameterize_scat_amp,
-    reparameterize_scat_pos,
-)
+# from infer.simulate import (
+#     ForwardSettings,
+#     OptVars,
+#     inverse_reparameterize_opt_vars,
+#     inverse_reparameterize_scat_amp,
+#     inverse_reparameterize_scat_pos,
+#     reparameterize_opt_vars,
+#     reparameterize_scat_amp,
+#     reparameterize_scat_pos,
+# )
 
 # class SimulatorInfer(Operator):
 #     def __init__(self, scan, shape):
