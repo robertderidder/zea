@@ -192,8 +192,7 @@ def simulate_rf(
 
         result = ops.sum(result, axis=[0, 1])
         result = ops.irfft((ops.real(result), ops.imag(result)))
-        result = result[:n_ax, :]        
-        result = ops.transpose(result, (1, 0))
+
         parts.append(result)
 
     # Stack all transmits: list of [n_el, n_ax] -> [n_tx, n_el, n_ax]
