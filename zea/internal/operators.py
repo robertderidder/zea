@@ -384,9 +384,9 @@ class SimulatorFull(Operator):
         raise NotImplementedError("Transpose for SimulateOperatorJaxus is not implemented.")
 
     def __str__(self):
-        return f"SimulateOperator implemented in jax with scan n_tx={self.scan.n_tx}, probe center_freq={self.probe.center_frequency}"
+        return f"SimulateOperator implemented in Jax, without option to choose a subset of element and axial indices"
 
-from partial_sim import simulate_partial_rf_data
+from partial_sim_v0 import simulate_partial_rf_data
 
 @operator_registry(name="simulator_partial")
 class SimulatorPartial(Operator):
@@ -395,6 +395,7 @@ class SimulatorPartial(Operator):
     The operator is initialized with fixed scan and probe parameters.
     The forward operation takes an image, computes scatterer positions and magnitudes,
     and simulates the RF data using the ultrasound simulator.
+    #TODO: Distinguish between scatterers, and from image
     """
 
     def __init__(self, scan, shape):
@@ -402,22 +403,20 @@ class SimulatorPartial(Operator):
         self.scan = scan
         self.shape = shape
         self.positions = self.compute_scatterer_positions()
+        # self.n_points = n_points
+        # assert n_points <= self.scan.n_el * self.scan.n_ax, f"n_points can at maximum be n_ax*n_el = {self.scan.n_ax}*{self.scan.n_el}={self.scan.n_ax*self.scan.n_el} but got {n_points}"
 
     def compute_scatterer_positions(self):
         """
         Compute scatterer positions for each pixel in the image, using scan x/z limits and image shape.
         Returns an array of shape (n_pixels, 3) with [x, y, z] positions.
-        #TODO: Distinguish between scatterers, and from image
         """
         x_start, x_end = self.scan.xlims
         z_start, z_end = self.scan.zlims
-        # Accept (H, W), (H, W, C) or (B, H, W, C)
-        if len(self.shape) == 2:
-            H, W = self.shape
-        elif len(self.shape) >= 3:
-            H, W = self.shape[-3], self.shape[-2]
-        else:
-            raise ValueError(f"Invalid shape {self.shape}. Expected (H, W), (H, W, C), or (B, H, W, C).")
+        if len(self.shape) != 2:
+            raise ValueError(f"Invalid shape {self.shape}. Expected (H, W).")
+        H, W = self.shape[0], self.shape[1]
+        
         x = ops.linspace(x_start, x_end, H)
         z = ops.linspace(z_start, z_end, W)
         xv, zv = ops.meshgrid(x, z, indexing='ij')
@@ -430,23 +429,29 @@ class SimulatorPartial(Operator):
     # def magnitude_from_image(self, image_log):
     #     image_lin = 10 ** (image_log / 20)
 
-    def forward(self, image, n_points):
+    def forward(self, image):
         """
-        Simulates RF data from the input image.
+        Simulates RF data from the input images.
         Each pixel is a scatterer, pixel value is magnitude.
         """
         assert len(image.shape)==4, f"Image should be of shape [n_frames, H, W, 1] but got {image.shape}"
-        assert n_points <= self.scan.n_el * self.scan.n_ax, f"n_points can at maximum be n_ax*n_el = {self.scan.n_ax}*{self.scan.n_el}={self.scan.n_ax*self.scan.n_el} but got {n_points}"
-        n_frames, *img_shape = image.shape
-        magnitudes = ops.reshape(image, (n_frames, -1))[0] #e.g. [17, 12544] --> (12544,) # TODO expand to more than 1 image
         
-        total_pixels = self.scan.n_ax * self.scan.n_el
+        n_frames, *img_shape = image.shape
+        magnitudes = ops.reshape(image, (n_frames, -1))[0]
+        # total_pixels = self.scan.n_ax * self.scan.n_el
 
-        key = jax.random.PRNGKey(42) # Use your seed here
-        flat_indices = jax.random.choice(key, total_pixels, shape=(n_points,), replace=False)
-        ax_indices, el_indices = jnp.unravel_index(flat_indices, (self.scan.n_ax, self.scan.n_el))
+        key = jax.random.PRNGKey(51) # Use your seed here
+        # flat_indices = jax.random.choice(key, total_pixels, shape=(self.n_points,), replace=False)
+        # ax_indices, el_indices = jnp.unravel_index(flat_indices, (self.scan.n_ax, self.scan.n_el))
+        ax_indices = jax.random.choice(key,self.scan.n_ax,(100,),replace=False)
+        el_indices = jax.random.choice(key,self.scan.n_el,(10,),replace=False)
+
+        ax_indices = jax.numpy.sort(ax_indices)
+        el_indices = jax.numpy.sort(el_indices)
 
         rf_data = simulate_partial_rf_data(
+            ax_indices = ax_indices,
+            el_indices = el_indices,
             scatterer_positions = self.positions[...,[0,2]],
             scatterer_amplitudes = magnitudes,
             t0_delays = self.scan.t0_delays,
@@ -457,97 +462,11 @@ class SimulatorPartial(Operator):
             element_width_wl = self.scan.element_width,
             sampling_frequency = self.scan.sampling_frequency,
             carrier_frequency = self.scan.center_frequency,
-            ax_indices = ax_indices,
-            el_indices = el_indices
         )
-        return rf_data, ax_indices, el_indices
+        return rf_data
     
     def transpose(self):
         raise NotImplementedError("Transpose for SimulateOperatorJaxus is not implemented.")
 
     def __str__(self):
-        return f"SimulateOperator implemented in jax with scan n_tx={self.scan.n_tx}, probe center_freq={self.probe.center_frequency}"
-
-# from infer.simulate import (
-#     ForwardSettings,
-#     OptVars,
-#     inverse_reparameterize_opt_vars,
-#     inverse_reparameterize_scat_amp,
-#     inverse_reparameterize_scat_pos,
-#     reparameterize_opt_vars,
-#     reparameterize_scat_amp,
-#     reparameterize_scat_pos,
-# )
-
-# class SimulatorInfer(Operator):
-#     def __init__(self, scan, shape):
-#         super().__init__()
-#         self.scan = scan.copy()
-#         self.shape = shape
-#         self.positions = self.get_positions(scan)
-
-#     def compute_scatterer_positions(self):
-#         """
-#         Compute scatterer positions for each pixel in the image, using scan x/z limits and image shape.
-#         Returns an array of shape (n_pixels, 3) with [x, y, z] positions.
-#         #TODO: Distinguish between scatterers, and from image
-#         """
-#         x_start, x_end = self.scan.xlims
-#         z_start, z_end = self.scan.zlims
-#         # Accept (H, W), (H, W, C) or (B, H, W, C)
-#         if len(self.shape) == 2:
-#             H, W = self.shape
-#         elif len(self.shape) >= 3:
-#             H, W = self.shape[-3], self.shape[-2]
-#         else:
-#             raise ValueError(f"Invalid shape {self.shape}. Expected (H, W), (H, W, C), or (B, H, W, C).")
-#         x = ops.linspace(x_start, x_end, H)
-#         z = ops.linspace(z_start, z_end, W)
-#         xv, zv = ops.meshgrid(x, z, indexing='ij')
-#         x_flat = ops.reshape(xv, [-1])
-#         z_flat = ops.reshape(zv, [-1])
-#         y_flat = ops.zeros_like(x_flat)
-#         positions = ops.stack([x_flat, y_flat, z_flat], axis=1)
-#         return positions
-    
-#     def forward(self, image):
-#         forward_settings = ForwardSettings(
-#             probe_geometry_m=jnp.array(self.scan.probe_geometry),
-#             t0_delays_tx_s=jnp.array(self.scan.t0_delays),
-#             tgc_gain_curve=jnp.array(self.scan.tgc_gain_curve),            
-#             active_element_idx=jnp.array(active_element_idx),
-#             initial_times_s=jnp.array(self.scan.initial_times),
-#             sound_speed_mps=jnp.array(self.scan.sound_speed),
-
-#             sampling_frequency_hz=jnp.array(self.scan.sampling_frequency),
-#             center_frequency_hz=jnp.array(self.scan.center_frequency),
-#             tw_indices=jnp.array(
-#                 [0], dtype=jnp.int32
-#             ),  # TODO # jnp.array(self.scan.tx_waveform_indices, dtype=jnp.int32),
-#             element_width_m=jnp.array(self.scan.element_width),
-#             pos_vfocus_m=None,  # TODO
-#             tx_apodizations_tx=jnp.array(tx_apodizations_tx),
-#             waveform_samples=jnp.array(waveform_samples),
-#             slope=slope,
-#             intercept=intercept,
-#             scat_amp_reparameterization=self.scat_amp_reparameterization,
-#             n_grad_scat=self.n_grad_scat,
-#             forward_model_type=self.forward_model_type,
-#             optimize_scatterer_positions=self.optimize_scatterer_positions,
-#             apply_lens_correction=self.apply_lens_correction,
-#             lens_sound_speed_mps=self.lens_sound_speed_mps,
-#             lens_thickness=self.lens_thickness,
-#             tx_travel_texture=None,  # TODO
-#             rx_travel_texture=None,  # TODO
-#             target_region_m=jnp.array(self.target_region_m),
-#             symlog_epsilon=self.symlog_epsilon,
-#             enable_wavelength_scaling=self.enable_wavelength_scaling,
-#         )
-        
-
-#     def transpose(self, data, *args, **kwargs):
-#         return super().transpose(data, *args, **kwargs)
-    
-#     def __str__(self):
-#         return f"Simulator from INFER"
-    
+        return f"SimulateOperator implemented in jax"
