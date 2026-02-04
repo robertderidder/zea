@@ -89,4 +89,6 @@ The following list contains some of the papers that have been published using ``
    penninga2025deep
    van2025patient
    stevens2025semantic
-   stevens2025nuclear
+   stevens2026nuclear
+   nolan2026task
+   federici2026informative

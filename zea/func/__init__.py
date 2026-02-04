@@ -53,6 +53,7 @@ from .ultrasound import (
     get_low_pass_iq_filter,
     hilbert,
     log_compress,
+    make_tgc_curve,
     upmix,
 )
 
@@ -106,4 +107,5 @@ __all__ = [
     "hilbert",
     "upmix",
     "log_compress",
+    "make_tgc_curve",
 ]

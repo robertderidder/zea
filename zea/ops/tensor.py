@@ -134,6 +134,13 @@ class Normalize(Operation):
             [np.float32(x) if x is not None else None for x in data] if data is not None else None
         )
 
+    @property
+    def valid_keys(self):
+        if self.input_range is None:
+            return super().valid_keys.union({"maxval", "minval"})
+        else:
+            return super().valid_keys
+
     def call(self, **kwargs):
         """Normalize data to a given range.
 

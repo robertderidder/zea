@@ -18,6 +18,7 @@ from zea.func.ultrasound import (
     channels_to_complex,
     complex_to_channels,
     compute_time_to_peak_stack,
+    make_tgc_curve,
 )
 from zea.ops import Pipeline, Simulate
 from zea.probes import Probe
@@ -289,11 +290,12 @@ def test_up_and_down_conversion(factor, batch_size):
             ],
             axis=1,
         )
+        scat_positions = np.expand_dims(scat_positions, axis=0)  # add batch dimension
 
         output = simulator_pipeline(
             **parameters,
             scatterer_positions=scat_positions.astype(np.float32),
-            scatterer_magnitudes=np.ones(n_scat, dtype=np.float32),
+            scatterer_magnitudes=np.ones((1, n_scat), dtype=np.float32),
         )
 
         data.append(keras.ops.convert_to_numpy(output["data"]))
@@ -575,3 +577,38 @@ def test_apply_window(axis, size, start, end, window_type):
     elif axis == 1:
         assert data_out[:, :start, :].numpy().sum() == 0.0, "Start region not zeroed correctly."
         assert data_out[:, -end:, :].numpy().sum() == 0.0, "End region not zeroed correctly."
+
+
+def test_make_tgc_curve():
+    """Test that TGC curve is monotonically increasing with depth."""
+    n_ax = 1000
+    attenuation_coef = 0.5  # dB/cm/MHz (typical for soft tissue)
+    sampling_frequency = 40e6  # 40 MHz
+    center_frequency = 5e6  # 5 MHz
+    sound_speed = 1540  # m/s
+
+    tgc_curve = make_tgc_curve(
+        n_ax=n_ax,
+        attenuation_coef=attenuation_coef,
+        sampling_frequency=sampling_frequency,
+        center_frequency=center_frequency,
+        sound_speed=sound_speed,
+    )
+
+    # Check output shape
+    assert tgc_curve.shape == (n_ax,), f"Expected shape ({n_ax},), got {tgc_curve.shape}"
+
+    # Check output dtype
+    assert tgc_curve.dtype == np.float32, f"Expected dtype float32, got {tgc_curve.dtype}"
+
+    # Check that the curve is monotonically increasing (TGC should increase with depth)
+    differences = np.diff(tgc_curve)
+    assert np.all(differences >= 0), "TGC curve should be monotonically increasing with depth"
+
+    # Check that the first value is 1 (no gain at zero depth)
+    assert np.isclose(tgc_curve[0], 1.0, rtol=1e-5), (
+        f"TGC curve should start at 1.0 (no gain at zero depth), got {tgc_curve[0]}"
+    )
+
+    # Check that values are positive
+    assert np.all(tgc_curve > 0), "TGC curve values should be positive"

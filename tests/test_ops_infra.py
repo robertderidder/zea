@@ -656,7 +656,8 @@ def ultrasound_scan(ultrasound_probe):
 
 
 def get_scatterers():
-    """Returns scatterer positions and magnitudes for ultrasound simulation tests."""
+    """Returns scatterer positions and magnitudes for ultrasound simulation tests.
+    Has a batch dimension of 1."""
     scat_x, scat_z = np.meshgrid(
         np.linspace(-10e-3, 10e-3, 5),
         np.linspace(10e-3, 30e-3, 5),
@@ -673,10 +674,11 @@ def get_scatterers():
         ],
         axis=1,
     )
+    scat_positions = np.expand_dims(scat_positions, axis=0)  # add batch dimension
 
     return {
         "positions": scat_positions.astype(np.float32),
-        "magnitudes": np.ones(n_scat, dtype=np.float32),
+        "magnitudes": np.ones((1, n_scat), dtype=np.float32),
         "n_scat": n_scat,
     }
 
@@ -687,24 +689,29 @@ def ultrasound_scatterers():
     return get_scatterers()
 
 
-def test_simulator(ultrasound_probe, ultrasound_scan, ultrasound_scatterers):
+@pytest.mark.parametrize(
+    "with_batch_dim",
+    [False, True],
+)
+def test_simulator(ultrasound_probe, ultrasound_scan, ultrasound_scatterers, with_batch_dim):
     """Tests the simulator operation."""
-    pipeline = ops.Pipeline([ops.Simulate()])
+    pipeline = ops.Pipeline([ops.Simulate()], with_batch_dim=with_batch_dim)
     parameters = pipeline.prepare_parameters(ultrasound_probe, ultrasound_scan)
+
+    if not with_batch_dim:
+        # remove batch_dim of scatterers for pipeline without batch dimension
+        ultrasound_scatterers["positions"] = ultrasound_scatterers["positions"][0]
+        ultrasound_scatterers["magnitudes"] = ultrasound_scatterers["magnitudes"][0]
 
     output = pipeline(
         **parameters,
         scatterer_positions=ultrasound_scatterers["positions"],
         scatterer_magnitudes=ultrasound_scatterers["magnitudes"],
     )
-
-    assert output["data"].shape == (
-        1,
-        ultrasound_scan.n_tx,
-        ultrasound_scan.n_ax,
-        ultrasound_scan.n_el,
-        1,
-    )
+    # assert output shape with batch dimension if with_batch_dim else without
+    expected_shape = (ultrasound_scan.n_tx, ultrasound_scan.n_ax, ultrasound_scan.n_el, 1)
+    expected_shape = (1,) + expected_shape if with_batch_dim else expected_shape
+    assert output["data"].shape == expected_shape
 
 
 @pytest.mark.heavy
@@ -719,7 +726,6 @@ def test_default_ultrasound_pipeline(
     # all dynamic parameters are set in the call method of the operations
     # or equivalently in the pipeline call (which is passed to the operations)
     parameters = default_pipeline.prepare_parameters(ultrasound_probe, ultrasound_scan)
-
     output_default = default_pipeline(
         **parameters,
         scatterer_positions=ultrasound_scatterers["positions"],

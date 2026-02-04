@@ -122,6 +122,7 @@ from .tensor import (
 )
 from .ultrasound import (
     AnisotropicDiffusion,
+    BandPassFilter,
     ChannelsToComplex,
     Companding,
     ComplexToChannels,
@@ -131,7 +132,7 @@ from .ultrasound import (
     FirFilter,
     LeeFilter,
     LogCompress,
-    LowPassFilter,
+    LowPassFilterIQ,
     PfieldWeighting,
     ReshapeGrid,
     ScanConvert,
@@ -167,6 +168,7 @@ __all__ = [
     "Threshold",
     # Ultrasound operations
     "AnisotropicDiffusion",
+    "BandPassFilter",
     "ChannelsToComplex",
     "Companding",
     "ComplexToChannels",
@@ -176,7 +178,7 @@ __all__ = [
     "FirFilter",
     "LeeFilter",
     "LogCompress",
-    "LowPassFilter",
+    "LowPassFilterIQ",
     "PfieldWeighting",
     "ReshapeGrid",
     "ScanConvert",
