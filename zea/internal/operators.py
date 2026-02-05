@@ -387,25 +387,26 @@ class SimulatorFull(Operator):
         return f"SimulateOperator implemented in Jax, without option to choose a subset of element and axial indices"
 
 from partial_sim_v0 import simulate_partial_rf_data
+from zea.func import translate
 
 @operator_registry(name="simulator_partial")
 class SimulatorPartial(Operator):
     """
     Operator for simulating RF data from an image.
-    The operator is initialized with fixed scan and probe parameters.
-    The forward operation takes an image, computes scatterer positions and magnitudes,
-    and simulates the RF data using the ultrasound simulator.
-    #TODO: Distinguish between scatterers, and from image
+    The operator is initialized with fixed scan parameters.
+    The forward operator takes a logcompressed image, normalized between -1 and 1
+    It is then translated to dynamic range and log uncompressed and generates rf_data
     """
 
-    def __init__(self, scan, shape):
+    def __init__(self, scan, shape, n_ax_samples=10, n_el_samples=10, dynamic_range = (-40,0)):
         super().__init__()
         self.scan = scan
         self.shape = shape
         self.positions = self.compute_scatterer_positions()
-        # self.n_points = n_points
-        # assert n_points <= self.scan.n_el * self.scan.n_ax, f"n_points can at maximum be n_ax*n_el = {self.scan.n_ax}*{self.scan.n_el}={self.scan.n_ax*self.scan.n_el} but got {n_points}"
-
+        self.n_ax_samples = n_ax_samples
+        self.n_el_samples = n_el_samples
+        self.dynamic_range = dynamic_range
+        
     def compute_scatterer_positions(self):
         """
         Compute scatterer positions for each pixel in the image, using scan x/z limits and image shape.
@@ -413,9 +414,14 @@ class SimulatorPartial(Operator):
         """
         x_start, x_end = self.scan.xlims
         z_start, z_end = self.scan.zlims
-        if len(self.shape) != 2:
-            raise ValueError(f"Invalid shape {self.shape}. Expected (H, W).")
-        H, W = self.shape[0], self.shape[1]
+        if len(self.shape) == 2:
+            H, W = self.shape[0], self.shape[1]
+        elif len(self.shape) == 3:
+            H, W = self.shape[0], self.shape[1]
+        elif len(self.shape) == 4:
+            B, H, W = self.shape[0], self.shape[1], self.shape[2]
+        else:
+            raise ValueError(f"Expected a shape of lenght 2, 3, or 4, instead got {self.shape}") 
         
         x = ops.linspace(x_start, x_end, H)
         z = ops.linspace(z_start, z_end, W)
@@ -426,25 +432,26 @@ class SimulatorPartial(Operator):
         positions = ops.stack([x_flat, y_flat, z_flat], axis=1)
         return positions
     
-    # def magnitude_from_image(self, image_log):
-    #     image_lin = 10 ** (image_log / 20)
+    def img_to_magnitude(self,image):
+        image = translate(image, self.dynamic_range)
+        image_lin = 10**(image/20)
+        return image_lin
 
     def forward(self, image):
         """
         Simulates RF data from the input images.
+        Image should have values between -1 and 1
         Each pixel is a scatterer, pixel value is magnitude.
         """
         assert len(image.shape)==4, f"Image should be of shape [n_frames, H, W, 1] but got {image.shape}"
         
         n_frames, *img_shape = image.shape
-        magnitudes = ops.reshape(image, (n_frames, -1))[0]
-        # total_pixels = self.scan.n_ax * self.scan.n_el
+        magnitudes = self.img_to_magnitude(image)
+        magnitudes = ops.reshape(image, (n_frames, -1))
 
         key = jax.random.PRNGKey(51) # Use your seed here
-        # flat_indices = jax.random.choice(key, total_pixels, shape=(self.n_points,), replace=False)
-        # ax_indices, el_indices = jnp.unravel_index(flat_indices, (self.scan.n_ax, self.scan.n_el))
-        ax_indices = jax.random.choice(key,self.scan.n_ax,(100,),replace=False)
-        el_indices = jax.random.choice(key,self.scan.n_el,(10,),replace=False)
+        ax_indices = jax.random.choice(key,self.scan.n_ax,(self.n_ax_samples,),replace=False)
+        el_indices = jax.random.choice(key,self.scan.n_el,(self.n_el_samples,),replace=False)
 
         ax_indices = jax.numpy.sort(ax_indices)
         el_indices = jax.numpy.sort(el_indices)
