@@ -41,6 +41,7 @@ tf = _import_tf()
 
 import matplotlib.pyplot as plt
 import numpy as np
+import jax.numpy as jnp
 
 def save_diffusion_frame(step, noisy_img, pred_img, signal_rates, noise_rates):
     fig, axs = plt.subplots(2, 2, figsize=(20, 20))
@@ -295,7 +296,10 @@ class DiffusionModel(DeepGenerativeModel):
                 `(batch_size, n_samples, *input_shape)`.
 
         """
-        batch_size = ops.shape(measurements)[0]
+        # batch_size, *measurements_shape = ops.shape(measurements) 
+        # shape = (batch_size, n_samples, *measurements_shape)
+        # Allow for other types of measurement, than images of self.shape
+        batch_size = ops.shape(measurements)[0] 
         shape = (batch_size, n_samples, *self.input_shape)
 
         def _tile_with_sample_dim(tensor):
@@ -969,7 +973,21 @@ class DPS(DiffusionGuidance):
         # Note that while the DPS paper specifies a squared L2 here, we follow their
         # implementation, which uses a standard L2:
         # https://github.com/DPS2022/diffusion-posterior-sampling/blob/effbde7325b22ce8dc3e2c06c160c021e743a12d/guided_diffusion/condition_methods.py#L31  # noqa: E501
-        measurement_error = omega * L2(measurements - self.operator.forward(pred_images, **kwargs))
+        output = self.operator.forward(pred_images, **kwargs)
+        if len(output) == 1:
+            measurement_error = omega * L2(measurements - output)
+            
+        if len(output) == 3:
+            forwarded, ax_indices, el_indices = output
+
+            grid_idx = jnp.ix_(
+            jnp.arange(measurements.shape[0]), # Batch dim
+            jnp.arange(measurements.shape[1]), # Transmit/Frame dim
+            ax_indices,                        # Axial indices
+            el_indices,                        # Element indices
+            jnp.arange(measurements.shape[4])  # Last dim (e.g. Channel)
+    )
+            measurement_error = omega * L2(measurements[grid_idx] - forwarded)
 
         return measurement_error, (pred_noises, pred_images)
 

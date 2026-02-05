@@ -470,7 +470,7 @@ class SimulatorPartial(Operator):
             sampling_frequency = self.scan.sampling_frequency,
             carrier_frequency = self.scan.center_frequency,
         )
-        return rf_data
+        return (rf_data, ax_indices, el_indices)
     
     def transpose(self):
         raise NotImplementedError("Transpose for SimulateOperatorJaxus is not implemented.")
