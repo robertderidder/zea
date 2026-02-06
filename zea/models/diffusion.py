@@ -722,7 +722,9 @@ class DiffusionModel(DeepGenerativeModel):
         )
 
         def step_fn(step, loop_state):
+
             noisy_images, pred_images, seed = loop_state
+            seed, seed1, seed2 = split_seed(seed, 3)
 
             diffusion_times = base_diffusion_times - step * step_size
             noise_rates, signal_rates = self.diffusion_schedule(diffusion_times)
@@ -733,13 +735,13 @@ class DiffusionModel(DeepGenerativeModel):
 
             gradients, (error, (pred_noises, pred_images)) = self.guidance_fn(
                 noisy_images,
+                seed=seed1,
                 measurements=measurements,
                 noise_rates=noise_rates,
                 signal_rates=signal_rates,
                 **kwargs,
             )
 
-            seed, seed1 = split_seed(seed, 2)
             next_noisy_images = self.reverse_diffusion_step(
                 shape=(num_images, *input_shape),
                 pred_images=pred_images,
@@ -747,7 +749,7 @@ class DiffusionModel(DeepGenerativeModel):
                 signal_rates=signal_rates,
                 next_signal_rates=next_signal_rates,
                 next_noise_rates=next_noise_rates,
-                seed=seed1,
+                seed=seed2,
                 stochastic_sampling=stochastic_sampling,
             )
 
@@ -943,6 +945,7 @@ class DPS(DiffusionGuidance):
     def compute_error(
         self,
         noisy_images,
+        seed,
         measurements,
         noise_rates,
         signal_rates,
@@ -973,12 +976,12 @@ class DPS(DiffusionGuidance):
         # Note that while the DPS paper specifies a squared L2 here, we follow their
         # implementation, which uses a standard L2:
         # https://github.com/DPS2022/diffusion-posterior-sampling/blob/effbde7325b22ce8dc3e2c06c160c021e743a12d/guided_diffusion/condition_methods.py#L31  # noqa: E501
-        output = self.operator.forward(pred_images, **kwargs)
+        output = self.operator.forward(pred_images, seed, **kwargs)
         if len(output) == 1:
             measurement_error = omega * L2(measurements - output)
             
         if len(output) == 3:
-            forwarded, ax_indices, el_indices = output
+            rf_data, ax_indices, el_indices = output
 
             grid_idx = jnp.ix_(
             jnp.arange(measurements.shape[0]), # Batch dim
@@ -987,7 +990,7 @@ class DPS(DiffusionGuidance):
             el_indices,                        # Element indices
             jnp.arange(measurements.shape[4])  # Last dim (e.g. Channel)
     )
-            measurement_error = omega * L2(measurements[grid_idx] - forwarded)
+            measurement_error = omega * L2(measurements[grid_idx] - rf_data)
 
         return measurement_error, (pred_noises, pred_images)
 

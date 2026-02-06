@@ -433,25 +433,25 @@ class SimulatorPartial(Operator):
         return positions
     
     def img_to_magnitude(self,image):
-        image = translate(image, self.dynamic_range)
+        image = translate(image, range_to=self.dynamic_range)
         image_lin = 10**(image/20)
         return image_lin
 
-    def forward(self, image):
+    def forward(self, image, seed=None):
         """
         Simulates RF data from the input images.
-        Image should have values between -1 and 1
+        Image eyshould have values between -1 and 1
         Each pixel is a scatterer, pixel value is magnitude.
         """
         assert len(image.shape)==4, f"Image should be of shape [n_frames, H, W, 1] but got {image.shape}"
-        
+        if seed is None:
+            raise ValueError("A random seed must be provided.")
         n_frames, *img_shape = image.shape
         magnitudes = self.img_to_magnitude(image)
-        magnitudes = ops.reshape(image, (n_frames, -1))
+        magnitudes = ops.reshape(magnitudes, (n_frames, -1))
 
-        key = jax.random.PRNGKey(51) # Use your seed here
-        ax_indices = jax.random.choice(key,self.scan.n_ax,(self.n_ax_samples,),replace=False)
-        el_indices = jax.random.choice(key,self.scan.n_el,(self.n_el_samples,),replace=False)
+        ax_indices = jax.random.choice(seed,self.scan.n_ax,(self.n_ax_samples,),replace=False)
+        el_indices = jax.random.choice(seed,self.scan.n_el,(self.n_el_samples,),replace=False)
 
         ax_indices = jax.numpy.sort(ax_indices)
         el_indices = jax.numpy.sort(el_indices)
