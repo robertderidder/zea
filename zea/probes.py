@@ -234,3 +234,28 @@ class Esaote_sll1543(Probe):
             bandwidth_MHz=bandwidth_MHz,
             probe_type="linear",
         )
+
+@probe_registry(name="philips_S5_1")
+class philips_S5_1(Probe):
+    """Philips S5_1 linear ultrasound transducer."""
+
+    def __init__(self):
+        """Philips S5_1 linear ultrasound transducer."""
+
+        n_el = 80
+        pitch = 0.25e-3
+        probe_geometry = create_probe_geometry(n_el, pitch)
+        bandwidth_MHz = 5 - 1
+
+        # elevation_focus = 18e-3
+        # sensitivity = -52 +/- 3 dB
+
+        super().__init__(
+            probe_geometry=probe_geometry,
+            center_frequency=3.125e6,
+            sampling_frequency=12.5e6,
+            xlims=(-0.0883, 0.0883),
+            zlims=(0, 0.09462),
+            bandwidth_MHz=bandwidth_MHz,
+            probe_type="linear",
+        )
