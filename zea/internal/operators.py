@@ -13,7 +13,9 @@ import jax.numpy as jnp
 
 from zea.internal.core import Object
 from zea.internal.registry import operator_registry
-
+from zea.func import translate
+#from zea.simulate_partial import simulate_partial_rf_data
+from partial_sim_v0 import simulate_partial_rf_data
 
 class Operator(abc.ABC, Object):
     """Operator base class.
@@ -354,7 +356,7 @@ class SimulatorFull(Operator):
         positions = ops.stack([x_flat, y_flat, z_flat], axis=1)
         return positions
     
-    def forward(self, image):
+    def forward(self, image, ):
         """
         Simulates RF data from the input image.
         Each pixel is a scatterer, pixel value is magnitude.
@@ -385,9 +387,6 @@ class SimulatorFull(Operator):
 
     def __str__(self):
         return f"SimulateOperator implemented in Jax, without option to choose a subset of element and axial indices"
-
-from partial_sim_v0 import simulate_partial_rf_data
-from zea.func import translate
 
 @operator_registry(name="simulator_partial")
 class SimulatorPartial(Operator):
@@ -433,14 +432,14 @@ class SimulatorPartial(Operator):
         return positions
     
     def img_to_magnitude(self,image):
-        image = translate(image, range_to=self.dynamic_range)
+        image = translate(image, range_from = (-1,1), range_to=self.dynamic_range)
         image_lin = 10**(image/20)
         return image_lin
 
     def forward(self, image, seed=None):
         """
         Simulates RF data from the input images.
-        Image eyshould have values between -1 and 1
+        Image magnitudes have values between -1 and 1
         Each pixel is a scatterer, pixel value is magnitude.
         """
         assert len(image.shape)==4, f"Image should be of shape [n_frames, H, W, 1] but got {image.shape}"
@@ -469,6 +468,7 @@ class SimulatorPartial(Operator):
             element_width_wl = self.scan.element_width,
             sampling_frequency = self.scan.sampling_frequency,
             carrier_frequency = self.scan.center_frequency,
+            verbose=True
         )
         return (rf_data, ax_indices, el_indices)
     
