@@ -397,7 +397,7 @@ class SimulatorPartial(Operator):
     It is then translated to dynamic range and log uncompressed and generates rf_data
     """
 
-    def __init__(self, scan, shape, n_ax_samples=10, n_el_samples=10, dynamic_range = (-40,0)):
+    def __init__(self, scan, shape, n_ax_samples=10, n_el_samples=10, dynamic_range = (-40,0), wavefront_only=False):
         super().__init__()
         self.scan = scan
         self.shape = shape
@@ -405,6 +405,7 @@ class SimulatorPartial(Operator):
         self.n_ax_samples = n_ax_samples
         self.n_el_samples = n_el_samples
         self.dynamic_range = dynamic_range
+        self.wavefront_only = wavefront_only
         
     def compute_scatterer_positions(self):
         """
@@ -436,7 +437,7 @@ class SimulatorPartial(Operator):
         image_lin = 10**(image/20)
         return image_lin
 
-    def forward(self, image, seed=None):
+    def forward(self, image, seed=None, **kwargs):
         """
         Simulates RF data from the input images.
         Image magnitudes have values between -1 and 1
@@ -468,7 +469,9 @@ class SimulatorPartial(Operator):
             element_width_wl = self.scan.element_width,
             sampling_frequency = self.scan.sampling_frequency,
             carrier_frequency = self.scan.center_frequency,
-            verbose=True
+            verbose=True,
+            wavefront_only=self.wavefront_only,
+            **kwargs
         )
         return (rf_data, ax_indices, el_indices)
     
