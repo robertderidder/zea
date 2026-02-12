@@ -4,6 +4,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import device_put, jit, vmap
 from tqdm import tqdm
+from zea import log
 
 #import jaxus.utils.log as log
 #from jaxus.containers.waveform import get_pulse
@@ -350,18 +351,18 @@ def simulate_rf_transmit(
     element_angles = jnp.array(element_angles)
     element_angles = device_put(element_angles, device=device)
 
-    # if wavefront_only is True:
-    #     if tx_angle_sensitivity is True:
-    #         tx_angle_sensitivity = False
-    #         log.warning(
-    #             "tx_angle_sensitivity is set to True while in wavefront_only mode. "
-    #             "Changed to False."
-    #         )
-    #     if verbose:
-    #         log.warning(
-    #             "wavefront only is True. tx_apodization will be ignored. Elements that are "
-    #             "turned off will be ignored by adding a large t0_delay."
-    #         )
+    if wavefront_only is True:
+        if tx_angle_sensitivity is True:
+            tx_angle_sensitivity = False
+            log.warning(
+                "tx_angle_sensitivity is set to True while in wavefront_only mode. "
+                "Changed to False."
+            )
+        if verbose:
+            log.warning(
+                "wavefront only is True. tx_apodization will be ignored. Elements that are "
+                "turned off will be ignored by adding a large t0_delay."
+            )
 
     tx_apodization = jnp.array(tx_apodization)
     tx_apodization = device_put(tx_apodization, device=device)
