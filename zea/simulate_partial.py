@@ -5,11 +5,7 @@ import numpy as np
 from jax import device_put, jit, vmap
 from tqdm import tqdm
 from zea import log
-
-#import jaxus.utils.log as log
-#from jaxus.containers.waveform import get_pulse
-#from jaxus.utils.checks import *
-
+from keras import ops
 
 def _get_vectorized_simulate_function(
     t0_delays,
@@ -326,7 +322,7 @@ def simulate_rf_transmit(
         jnp.array: The rf data of shape `(n_ax, n_el)`
     """
     if waveform_function is None:
-        tx_waveform = get_pulse(carrier_frequency, 400e-9)
+        tx_waveform = get_pulse(carrier_frequency, 3.0)
     else:
         tx_waveform = waveform_function
 
@@ -450,7 +446,6 @@ def simulate_rf_transmit(
         rf_data.append(rf_frame)
     rf_data = jnp.stack(rf_data, axis=0)
     return rf_data
-
 
 def simulate_partial_rf_data(
     ax_indices: jnp.array,
@@ -579,7 +574,7 @@ def simulate_partial_rf_data(
 
     return rf_data[...,None]
 
-def get_pulse(carrier_frequency, pulse_width, chirp_rate=0, phase=0):
+def get_pulse(carrier_frequency, pulse_width_wl, chirp_rate=0, phase=0):
     """Returns a function that computes a generalized waveform. The waveform can be
     a chirp by setting the chirp_rate to a nonzero value or a traditional pulse by
     setting the chirp_rate to zero.
@@ -589,7 +584,7 @@ def get_pulse(carrier_frequency, pulse_width, chirp_rate=0, phase=0):
         carrier_frequency : float
             The carrier frequency.
         pulse_width : float
-            The pulse width in seconds.
+            The pulse width periods. #FIX
         chirp_rate : float
             The chirp rate in Hz/s.
         phase : float
@@ -603,7 +598,7 @@ def get_pulse(carrier_frequency, pulse_width, chirp_rate=0, phase=0):
     if not isinstance(carrier_frequency, (float, int)):
         raise TypeError("carrier_frequency must be a float or an int")
 
-    if not isinstance(pulse_width, (float, int)):
+    if not isinstance(pulse_width_wl, (float, int)):
         raise TypeError("pulse_width must be a float or an int")
 
     if not isinstance(chirp_rate, (float, int)):
@@ -620,9 +615,14 @@ def get_pulse(carrier_frequency, pulse_width, chirp_rate=0, phase=0):
 
         Returns
         -------
-        np.array
+        np.arrayt
             The pulse waveform sampled at ``t``.
         """
+        # period = 1/carrier_frequency
+        # t = pulse_width*period
+
+        pulse_width = 1/carrier_frequency*pulse_width_wl
+
         sigma = (0.5 * pulse_width) / jnp.sqrt(-np.log(0.1))
         t = t - pulse_width
         y = jnp.exp(-((t / sigma) ** 2))

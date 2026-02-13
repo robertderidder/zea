@@ -14,8 +14,7 @@ import jax.numpy as jnp
 from zea.internal.core import Object
 from zea.internal.registry import operator_registry
 from zea.func import translate
-#from zea.simulate_partial import simulate_partial_rf_data
-from partial_sim_v0 import simulate_partial_rf_data
+from zea.simulate_partial import simulate_partial_rf_data
 
 class Operator(abc.ABC, Object):
     """Operator base class.
@@ -455,7 +454,7 @@ class SimulatorPartial(Operator):
 
         ax_indices = jax.numpy.sort(ax_indices)
         el_indices = jax.numpy.sort(el_indices)
-
+        
         rf_data = simulate_partial_rf_data(
             ax_indices = ax_indices,
             el_indices = el_indices,
