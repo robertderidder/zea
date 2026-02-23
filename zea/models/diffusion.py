@@ -980,12 +980,12 @@ class DPS(DiffusionGuidance):
         if len(output) == 1:
             measurement_error = omega * L2(measurements - output)
             
-        if len(output) == 3:
-            rf_data, ax_indices, el_indices = output
+        if len(output) == 4:
+            rf_data, ax_indices, el_indices, tx_indices = output
 
             grid_idx = jnp.ix_(
             jnp.arange(measurements.shape[0]), # Batch dim
-            jnp.arange(measurements.shape[1]), # Transmit/Frame dim
+            tx_indices,                        # Transmit/Frame dim
             ax_indices,                        # Axial indices
             el_indices,                        # Element indices
             jnp.arange(measurements.shape[4])  # Last dim (e.g. Channel)

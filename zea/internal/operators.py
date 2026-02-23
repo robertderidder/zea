@@ -480,7 +480,7 @@ class SimulatorPartial(Operator):
             wavefront_only=self.wavefront_only,
             **kwargs
         )
-        return (rf_data, ax_indices, el_indices)
+        return (rf_data, ax_indices, el_indices, tx_indices)
     
     def transpose(self):
         raise NotImplementedError("Transpose for SimulateOperatorJaxus is not implemented.")
