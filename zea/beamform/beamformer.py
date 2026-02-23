@@ -815,39 +815,23 @@ def calculate_delays_heterogeneous_medium(
     element_z = probe_geometry[:, 2]
 
     def _interpolate_slowness(p, el_x, el_z):
-        """Bilinearly interpolate the slowness map at a point along a ray."""
         xp = p * (grid_x - el_x) + el_x
         zp = p * (grid_z - el_z) + el_z
 
-        # Convert spatial locations to fractional indices in the slowness map
         dx_sos = sos_grid_x[1] - sos_grid_x[0]
         dz_sos = sos_grid_z[1] - sos_grid_z[0]
 
-        xit = ops.clip((xp - sos_grid_x[0]) / dx_sos, 0, slowness_map.shape[1] - 1)
-        zit = ops.clip((zp - sos_grid_z[0]) / dz_sos, 0, slowness_map.shape[0] - 1)
-        xi0 = ops.floor(xit)
-        zi0 = ops.floor(zit)
-        xi1 = ops.clip(xi0 + 1, 0, slowness_map.shape[1] - 1)
-        zi1 = ops.clip(zi0 + 1, 0, slowness_map.shape[0] - 1)
+        xit = (xp - sos_grid_x[0]) / dx_sos
+        zit = (zp - sos_grid_z[0]) / dz_sos
 
-        # Bilinear interpolation using flattened indexing
-        xi0_int = ops.cast(xi0, "int32")
-        zi0_int = ops.cast(zi0, "int32")
-        xi1_int = ops.cast(xi1, "int32")
-        zi1_int = ops.cast(zi1, "int32")
+        coords = ops.stack([zit, xit], axis=0)
 
-        nx = slowness_map.shape[1]
-        s_flat = ops.reshape(slowness_map, (-1,))
-        s00 = ops.take(s_flat, zi0_int * nx + xi0_int)
-        s10 = ops.take(s_flat, zi0_int * nx + xi1_int)
-        s01 = ops.take(s_flat, zi1_int * nx + xi0_int)
-        s11 = ops.take(s_flat, zi1_int * nx + xi1_int)
-
-        w00 = (xi1 - xit) * (zi1 - zit)
-        w10 = (xit - xi0) * (zi1 - zit)
-        w01 = (xi1 - xit) * (zit - zi0)
-        w11 = (xit - xi0) * (zit - zi0)
-        return s00 * w00 + s10 * w10 + s01 * w01 + s11 * w11
+        return keras.ops.image.map_coordinates(
+            slowness_map,
+            coords,
+            order=1,
+            fill_mode="nearest",
+        )
 
     # Euclidean distance from each element to each pixel
     dx = ops.abs(element_x[:, None] - grid_x[None, :])
@@ -868,7 +852,9 @@ def calculate_delays_heterogeneous_medium(
     rx_delays = tof * sampling_frequency
     tx_delays = (
         tof
-        + ops.diag(t0_delays)[:, None]  # Only for multistatic data
+        # The diagonal of t0_delays selects the appropriate transmit delay 
+        # for each element (n_tx, n_el) -> (n_tx,)
+        + ops.diag(t0_delays)[:, None] 
         - initial_times[:, None]
         + ops.take(t_peak, tx_waveform_indices)[:, None]
     ) * sampling_frequency
