@@ -81,11 +81,11 @@ def test_folder_copy_key_by_key(dummy_dataset_path, tmp_path):
         _other_keys = [k for k in _ALL_DATA_TYPES if k not in _copied_keys]
 
         # Copy the folder with the specified key
-        folder = Folder(dummy_dataset_path, key, validate=False)
-        folder.copy(tmp_path / "copy")
+        folder = Folder(dummy_dataset_path, validate=False)
+        folder.copy(tmp_path / "copy", key)
 
         # Check required keys in the copied folder
-        with Dataset(tmp_path / "copy", key, validate=False) as copied_folder:
+        with Dataset(tmp_path / "copy", validate=False) as copied_folder:
             for file in iter(copied_folder):
                 for key in _copied_keys:
                     assert key in file["data"], f"Copied folder does not contain {key} key"
@@ -102,14 +102,12 @@ def test_folder_copy_key_by_key(dummy_dataset_path, tmp_path):
 def test_folder_copy_all_keys(dummy_dataset_path, tmp_path):
     """Test copying a `zea.Folder` with all keys."""
 
-    some_key = _ALL_DATA_TYPES[0]
-
     # Copy the folder
-    folder = Folder(dummy_dataset_path, some_key, validate=False)
+    folder = Folder(dummy_dataset_path, validate=False)
     folder.copy(tmp_path / "copy", key="all")
 
     # Check required keys in the copied folder
-    with Dataset(tmp_path / "copy", some_key, validate=False) as copied_folder:
+    with Dataset(tmp_path / "copy", validate=False) as copied_folder:
         for file in iter(copied_folder):
             for key in _ALL_DATA_TYPES:
                 assert key in file["data"], f"Copied folder does not contain {key} key"
