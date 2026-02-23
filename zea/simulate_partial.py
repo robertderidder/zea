@@ -450,6 +450,7 @@ def simulate_rf_transmit(
 def simulate_partial_rf_data(
     ax_indices: jnp.array,
     el_indices: jnp.array,
+    tx_indices: jnp.array,
     scatterer_positions: jnp.array,
     scatterer_amplitudes: jnp.array,
     t0_delays: jnp.array,
@@ -482,6 +483,8 @@ def simulate_partial_rf_data(
         The indices of the axial samples
     el_indices:
         The indices of the elements
+    tx_indices : jnp.array
+        The indices of the transmits to simulate. Shape (n_selected_tx,).
     scatterer_positions : jnp.array
         The scatterer positions of shape `(n_scat, 2)`.
     scatterer_amplitudes : jnp.array
@@ -500,7 +503,7 @@ def simulate_partial_rf_data(
         arrays.
     tx_apodizations : jnp.array
         The transmit apodization of shape `(n_tx, n_el)`.
-    initial_times : np.array
+    initial_times : jnp.array
         The time instant of the first sample in seconds of shape `(n_tx,)`.
     element_width_wl : float
         The width of the elements in wavelengths of the center frequency.
@@ -529,11 +532,17 @@ def simulate_partial_rf_data(
 
     Returns
     -------
-        jnp.array: The rf data of shape `(batch_size, n_tx, n_ax, n_el, 1)`
+        jnp.array: The rf data of shape `(batch_size, n_selected_tx, n_ax, n_el, 1)`
     """
 
-    n_tx, _ = tx_apodizations.shape
+    # PRE-SELECT TRANSMIT PARAMETERS using advanced indexing
+    # This works even when tx_indices is a traced array because advanced indexing
+    # is JIT-compatible. It selects the subset of transmits we care about.
+    selected_t0_delays = jnp.take(t0_delays, tx_indices, axis=0)  # (n_selected_tx, n_el) # (n_selected_tx, n_el)
+    selected_tx_apod = jnp.take(tx_apodizations, tx_indices, axis=0)  # (n_selected_tx, n_el)
+    selected_initial_times = jnp.take(initial_times, tx_indices, axis=0)  # (n_selected_tx,)
 
+    n_tx = len(tx_indices)
     rf_transmits = []
 
     if progress_bar:
@@ -541,17 +550,19 @@ def simulate_partial_rf_data(
     else:
         pbar_fn = lambda x: x
 
+    # Now loop with concrete integers (0, 1, 2, ..., n_tx-1)
+    # This is always safe since these are not traced
     for tx in pbar_fn(range(n_tx)):
         rf_transmit = simulate_rf_transmit(
             ax_indices = ax_indices,
             el_indices = el_indices,
             scatterer_positions=scatterer_positions,
             scatterer_amplitudes=scatterer_amplitudes,
-            t0_delays=t0_delays[tx],
+            t0_delays=selected_t0_delays[tx],
             probe_geometry=probe_geometry,
             element_angles=element_angles,
-            tx_apodization=tx_apodizations[tx],
-            initial_time=initial_times[tx],
+            tx_apodization=selected_tx_apod[tx],
+            initial_time=selected_initial_times[tx],
             element_width_wl=element_width_wl,
             sampling_frequency=sampling_frequency,
             carrier_frequency=carrier_frequency,

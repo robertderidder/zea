@@ -396,7 +396,7 @@ class SimulatorPartial(Operator):
     It is then translated to dynamic range and log uncompressed and generates rf_data
     """
 
-    def __init__(self, scan, shape, n_ax_samples=10, n_el_samples=10, dynamic_range = (-40,0), wavefront_only=False):
+    def __init__(self, scan, shape, n_ax_samples=10, n_el_samples=10, n_tx_samples=None,dynamic_range = (-40,0), wavefront_only=False):
         super().__init__()
         self.scan = scan
         self.shape = shape
@@ -405,7 +405,12 @@ class SimulatorPartial(Operator):
         self.n_el_samples = n_el_samples
         self.dynamic_range = dynamic_range
         self.wavefront_only = wavefront_only
-        
+        #choose to sapmle n_tx, if given as an input parameter
+        if n_tx_samples is not None:
+            self.n_tx_samples = n_tx_samples
+        else:
+            self.n_tx_samples = self.scan.n_tx
+
     def compute_scatterer_positions(self):
         """
         Compute scatterer positions for each pixel in the image, using scan x/z limits and image shape.
@@ -451,13 +456,16 @@ class SimulatorPartial(Operator):
 
         ax_indices = jax.random.choice(seed,self.scan.n_ax,(self.n_ax_samples,),replace=False)
         el_indices = jax.random.choice(seed,self.scan.n_el,(self.n_el_samples,),replace=False)
+        tx_indices = jax.random.choice(seed,self.scan.n_tx,(self.n_tx_samples,),replace=False)
 
         ax_indices = jax.numpy.sort(ax_indices)
         el_indices = jax.numpy.sort(el_indices)
-        
+        tx_indices = jax.numpy.sort(tx_indices)
+
         rf_data = simulate_partial_rf_data(
             ax_indices = ax_indices,
             el_indices = el_indices,
+            tx_indices = tx_indices,
             scatterer_positions = self.positions[...,[0,2]],
             scatterer_amplitudes = magnitudes,
             t0_delays = self.scan.t0_delays,
