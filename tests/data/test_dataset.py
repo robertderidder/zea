@@ -195,7 +195,7 @@ def test_folder_properties(dummy_dataset_path):
     assert len(folder) == 2
     assert repr(folder).startswith("<zea.data.datasets.Folder at 0x")
     assert "2 files" in repr(folder)
-    assert dummy_dataset_path in repr(folder)
+    assert str(dummy_dataset_path) in repr(folder)
     assert str(folder) == f"Folder with 2 files in '{dummy_dataset_path}'"
 
 
@@ -217,8 +217,6 @@ def test_folder_rejects_invalid_type():
 
 def test_folder_rejects_single_file(dummy_dataset_path):
     """Folder raises ValueError when given a path to a single file."""
-    file_path = Path(dummy_dataset_path) / Path(dummy_dataset_path).iterdir().__next__().name
-    # find an actual .hdf5 file inside the dummy dataset folder
     file_path = next(Path(dummy_dataset_path).glob("*.hdf5"))
     with pytest.raises(ValueError, match="Use File class instead"):
         Folder(file_path, validate=False)
