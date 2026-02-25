@@ -262,6 +262,7 @@ class DiffusionModel(DeepGenerativeModel):
     def posterior_sample(
         self,
         measurements,
+        omega,
         n_samples=1,
         n_steps=20,
         initial_step=0,
@@ -328,6 +329,7 @@ class DiffusionModel(DeepGenerativeModel):
             initial_samples=initial_samples,
             initial_step=initial_step,
             seed=seed2,
+            omega = omega,
             **kwargs,
         )  # ( batch_size * n_samples, *self.input_shape)
 
@@ -671,6 +673,7 @@ class DiffusionModel(DeepGenerativeModel):
         self,
         measurements,
         initial_noise,
+        omega,
         diffusion_steps: int,
         initial_samples=None,
         initial_step: int = 0,
@@ -753,8 +756,16 @@ class DiffusionModel(DeepGenerativeModel):
                 stochastic_sampling=stochastic_sampling,
             )
 
-            next_noisy_images = next_noisy_images - gradients
-            pred_images = pred_images - gradients
+            # Normalize gradients to prevent explosion
+            grad_norm = ops.sqrt(ops.sum(gradients ** 2) + 1e-8)
+            normalized_gradients = gradients / (grad_norm + 1e-8)
+            
+            next_noisy_images = next_noisy_images - omega * normalized_gradients
+            pred_images = pred_images - omega * normalized_gradients
+            
+            # Clip predictions to valid range to prevent out-of-distribution values
+            # This ensures the diffusion model stays within its training distribution
+            pred_images = ops.clip(pred_images, -1.0, 1.0)
 
             # this new noisy image will be used in the next step
             if verbose:
@@ -949,7 +960,6 @@ class DPS(DiffusionGuidance):
         measurements,
         noise_rates,
         signal_rates,
-        omega,
         **kwargs,
     ):
         """
@@ -960,7 +970,6 @@ class DPS(DiffusionGuidance):
             measurements: Target measurement.
             noise_rates: Current noise rates.
             signal_rates: Current signal rates.
-            omega: Weight for the measurement error.
             **kwargs: Additional arguments for the operator.
 
         Returns:
@@ -978,7 +987,7 @@ class DPS(DiffusionGuidance):
         # https://github.com/DPS2022/diffusion-posterior-sampling/blob/effbde7325b22ce8dc3e2c06c160c021e743a12d/guided_diffusion/condition_methods.py#L31  # noqa: E501
         output = self.operator.forward(pred_images, seed, **kwargs)
         if len(output) == 1:
-            measurement_error = omega * L2(measurements - output)
+            measurement_error = L2(measurements - output)
             
         if len(output) == 4:
             rf_data, ax_indices, el_indices, tx_indices = output
@@ -990,7 +999,7 @@ class DPS(DiffusionGuidance):
             el_indices,                        # Element indices
             jnp.arange(measurements.shape[4])  # Last dim (e.g. Channel)
     )
-            measurement_error = omega * L2(measurements[grid_idx] - rf_data)
+            measurement_error = L2(measurements[grid_idx] - rf_data)
 
         return measurement_error, (pred_noises, pred_images)
 
@@ -1004,7 +1013,6 @@ class DPS(DiffusionGuidance):
             operator: Forward operator.
             noise_rates: Current noise rates.
             signal_rates: Current signal rates.
-            omega: Weight for the measurement error.
             **kwargs: Additional arguments for the operator.
 
         Returns:
