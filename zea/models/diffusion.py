@@ -22,6 +22,7 @@ from typing import Literal
 
 import keras
 from keras import ops
+import jax
 
 from zea.backend import _import_tf, jit
 from zea.backend.autograd import AutoGrad
@@ -756,6 +757,9 @@ class DiffusionModel(DeepGenerativeModel):
             next_noisy_images = next_noisy_images - gradients
             pred_images = pred_images - gradients
 
+            next_noisy_images = ops.clip(next_noisy_images, self.input_range[0], self.input_range[1])
+            pred_images = ops.clip(pred_images, self.input_range[0], self.input_range[1])
+
             # this new noisy image will be used in the next step
             if verbose:
                 progbar.update(step + 1, [("error", error)])
@@ -976,7 +980,14 @@ class DPS(DiffusionGuidance):
         # Note that while the DPS paper specifies a squared L2 here, we follow their
         # implementation, which uses a standard L2:
         # https://github.com/DPS2022/diffusion-posterior-sampling/blob/effbde7325b22ce8dc3e2c06c160c021e743a12d/guided_diffusion/condition_methods.py#L31  # noqa: E501
-        output = self.operator.forward(pred_images, seed, **kwargs)
+        # wrap the forward call in a rematerialization checkpoint so that JAX
+        # does not keep all intermediate activations in memory during gradient
+        # evaluation.  The high‑memory cost was observed when the operator
+        # itself was jitted (e.g. SimulatorPartial.forward).  Rematerialization
+        # forces recomputation on the backward pass, trading compute for memory.
+        forward_fn = jax.remat(self.operator.forward)
+        
+        output = forward_fn(pred_images, seed, **kwargs)
         if len(output) == 1:
             measurement_error = omega * L2(measurements - output)
             
