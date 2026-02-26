@@ -20,13 +20,17 @@ Example:
             ...
 """
 
+import os
 import re
 import threading
 from itertools import product
 from pathlib import Path
 from typing import List, Tuple, Union
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
+import keras
 
 from zea import log
 from zea.data.datasets import Dataset, H5FileHandleCache, count_samples_per_directory
@@ -667,6 +671,106 @@ def _numpy_resize(image, image_size, resize_type="resize", rng=None):
             "Choose from 'resize', 'center_crop', 'random_crop', 'crop_or_pad'."
         )
 
+def _make_transfer_fn(device: str | None = None):
+    """Build a closure that transfers a numpy array to a backend device.
+
+    All imports and device resolution happen **once** when this function is
+    called.  The returned closure captures the resolved objects directly,
+    so the per-batch hot path has zero import overhead.
+
+    Args:
+        device: Target device string, e.g. ``"gpu:0"``, ``"cuda:1"``,
+            ``"cpu"``.  ``None`` uses the framework default.
+
+    Returns:
+        ``(np.ndarray) -> tensor`` callable.
+    """
+    backend_name = keras.backend.backend()
+
+    if backend_name == "jax":
+        import jax
+        import jax.numpy as jnp
+
+        if device is not None:
+            from zea.backend.jax import str_to_jax_device
+
+            jax_device = str_to_jax_device(device)
+            return lambda array: jax.device_put(jnp.asarray(array), jax_device)
+        return lambda array: jax.device_put(jnp.asarray(array))
+
+    elif backend_name == "torch":
+        import torch
+
+        if device is not None:
+            torch_device = torch.device(device.replace("gpu", "cuda"))
+        else:
+            torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return lambda array: torch.as_tensor(array).to(torch_device, non_blocking=True)
+
+    elif backend_name == "tensorflow":
+        import tensorflow as tf
+
+        if device is not None:
+            tf_device = device.replace("cuda", "gpu")
+
+            def _tf_transfer(array):
+                with tf.device(tf_device):
+                    return tf.constant(array)
+
+            return _tf_transfer
+        return lambda array: tf.constant(array)
+
+    else:
+        # numpy or unknown backend – return as-is
+        return lambda array: array
+
+
+class _PrefetchToDevice:
+    """Iterator wrapper that transfers batches to a device one step ahead.
+
+    While the caller processes batch *N* on the GPU, this wrapper already
+    initiates the host-to-device copy for batch *N+1* in a background
+    thread.  This overlaps data transfer with computation, hiding the
+    CPU-to-GPU latency.
+
+    Args:
+        iterator: The source iterator yielding numpy arrays.
+        device: Target device string passed to :func:`_make_transfer_fn`.
+        prefetch_size: How many batches to keep in flight (default 2).
+    """
+
+    def __init__(self, iterator, device: str | None = None, prefetch_size: int = 2):
+        self._iterator = iterator
+        self._prefetch_size = prefetch_size
+        self._buffer: deque = deque()
+        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._exhausted = False
+        # Resolve imports and device once — the closure is import-free
+        self._transfer = _make_transfer_fn(device)
+        # Pre-fill the buffer
+        self._fill()
+
+    def _fill(self):
+        """Submit transfer jobs until the buffer reaches *prefetch_size*."""
+        while len(self._buffer) < self._prefetch_size and not self._exhausted:
+            try:
+                batch = next(self._iterator)
+            except StopIteration:
+                self._exhausted = True
+                break
+            future = self._executor.submit(self._transfer, batch)
+            self._buffer.append(future)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self._fill()
+        if not self._buffer:
+            self._executor.shutdown(wait=False)
+            raise StopIteration
+        future = self._buffer.popleft()
+        return future.result()
 
 class Dataloader:
     """High-performance HDF5 dataloader built on `Grain <https://github.com/google/grain>`_.
@@ -852,7 +956,11 @@ class Dataloader:
         )
 
     def __iter__(self):
-        return iter(self.to_iter_dataset())
+        it = self.to_iter_dataset()
+        device = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if device is not None:
+            return _PrefetchToDevice(it, device=device)
+        return it
 
     def __len__(self):
         """Number of batches (or samples if unbatched)."""
