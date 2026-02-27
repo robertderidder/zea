@@ -263,6 +263,7 @@ class DiffusionModel(DeepGenerativeModel):
     def posterior_sample(
         self,
         measurements,
+        omega,
         n_samples=1,
         n_steps=20,
         initial_step=0,
@@ -290,6 +291,7 @@ class DiffusionModel(DeepGenerativeModel):
                 for the diffusion process. Only used if `initial_step` is
                 greater than 0. Must be of shape `(batch_size, n_samples, *input_shape)`.
             seed: Random seed generator.
+            omega: step size
             **kwargs: Additional arguments.
 
         Returns:
@@ -324,13 +326,14 @@ class DiffusionModel(DeepGenerativeModel):
 
         out = self.reverse_conditional_diffusion(
             measurements=measurements,
+            omega=omega,
             initial_noise=initial_noise,
             diffusion_steps=n_steps,
             initial_samples=initial_samples,
             initial_step=initial_step,
             seed=seed2,
             **kwargs,
-        )  # ( batch_size * n_samples, *self.input_shape)
+        )
 
         return ops.reshape(out, shape)  # (batch_size, n_samples, *input_shape)
 
@@ -671,6 +674,7 @@ class DiffusionModel(DeepGenerativeModel):
     def reverse_conditional_diffusion(
         self,
         measurements,
+        omega,
         initial_noise,
         diffusion_steps: int,
         initial_samples=None,
@@ -754,8 +758,8 @@ class DiffusionModel(DeepGenerativeModel):
                 stochastic_sampling=stochastic_sampling,
             )
 
-            next_noisy_images = next_noisy_images - gradients
-            pred_images = pred_images - gradients
+            next_noisy_images = next_noisy_images - omega * gradients
+            pred_images = pred_images - omega * gradients
 
             next_noisy_images = ops.clip(next_noisy_images, self.input_range[0], self.input_range[1])
             pred_images = ops.clip(pred_images, self.input_range[0], self.input_range[1])
@@ -953,7 +957,6 @@ class DPS(DiffusionGuidance):
         measurements,
         noise_rates,
         signal_rates,
-        omega,
         **kwargs,
     ):
         """
@@ -989,7 +992,7 @@ class DPS(DiffusionGuidance):
         
         output = forward_fn(pred_images, seed, **kwargs)
         if len(output) == 1:
-            measurement_error = omega * L2(measurements - output)
+            measurement_error = L2(measurements - output)
             
         if len(output) == 4:
             rf_data, ax_indices, el_indices, tx_indices = output
@@ -1001,7 +1004,7 @@ class DPS(DiffusionGuidance):
             el_indices,                        # Element indices
             jnp.arange(measurements.shape[4])  # Last dim (e.g. Channel)
     )
-            measurement_error = omega * L2(measurements[grid_idx] - rf_data)
+            measurement_error = L2(measurements[grid_idx] - rf_data)
 
         return measurement_error, (pred_noises, pred_images)
 

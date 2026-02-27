@@ -221,11 +221,6 @@ def simulate_rf_transmit(
 
 @partial(jax.jit, static_argnames=(
     "wavefront_only",
-    "tx_angle_sensitivity",
-    "rx_angle_sensitivity",
-    "waveform_function",
-    "ax_chunk_size",
-    "scatterer_chunk_size",
 ))
 def simulate_partial_rf_data(
     ax_indices: jnp.array,
