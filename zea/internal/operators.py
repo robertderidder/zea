@@ -16,6 +16,7 @@ from zea.internal.registry import operator_registry
 from zea.func import translate
 from zea.simulate_partial import simulate_partial_rf_data
 from zea.simulator_jax import simulate_partial_rf_data as sim_jax
+from zea.display import scan_convert, compute_scan_convert_2d_coordinates
 
 class Operator(abc.ABC, Object):
     """Operator base class.
@@ -207,7 +208,7 @@ class SimulatorPartial(Operator):
     Operator for simulating RF data from an image.
     The operator is initialized with fixed scan parameters.
     The forward operator takes a logcompressed image, normalized between -1 and 1
-    It is then translated to dynamic range and log uncompressed and generates rf_data
+    It is then translated to dynamic range and log uncompressed and generates rf_datawaveform_one_way.png waveform_two_way.png
     """
 
     def __init__(self, scan, shape, n_ax_samples=10, n_el_samples=10, n_tx_samples=None,dynamic_range = (-40,0), wavefront_only=False):
@@ -217,38 +218,57 @@ class SimulatorPartial(Operator):
         self.positions = self.compute_scatterer_positions()
         self.n_ax_samples = n_ax_samples
         self.n_el_samples = n_el_samples
+        self.n_tx_samples = n_tx_samples
         self.dynamic_range = dynamic_range
         self.wavefront_only = wavefront_only
-        #choose to sapmle n_tx, if given as an input parameter
-        if n_tx_samples is not None:
-            assert n_tx_samples <= self.scan.n_tx, f"n_tx_samples should be less than or equal to scan.n_tx ({self.scan.n_tx}) but got {n_tx_samples}"
-            self.n_tx_samples = n_tx_samples
-        else:
-            self.n_tx_samples = self.scan.n_tx
 
     def compute_scatterer_positions(self):
         """
-        Compute scatterer positions for each pixel in the image, using scan x/z limits and image shape.
-        Returns an array of shape (n_pixels, 3) with [x, y, z] positions.
+        Computes the Cartesian coordinates of every scatterer (pixel) in the
+        polar image that the operator is initialised with.
+
+        The input image is assumed to live in ρ–θ space; the rows correspond to
+        radial samples between ``scan.rho_range`` and the columns to angles
+        between the first and last value of ``scan.polar_angles``.  The
+        transformation performed here is identical to the one performed by
+        :func:`zea.display.scan_convert_2d` when it is used with the same
+        scan parameters; this means that the positions returned here are the
+        physical (x,y,z) locations beneath the probe.  Only the x and z
+        components are passed to the JAX simulator – the y coordinate is
+        zero.
         """
-        x_start, x_end = self.scan.xlims
-        z_start, z_end = self.scan.zlims
-        if len(self.shape) == 2:
-            H, W = self.shape[0], self.shape[1]
-        elif len(self.shape) == 3:
-            H, W = self.shape[0], self.shape[1]
-        elif len(self.shape) == 4:
-            B, H, W = self.shape[0], self.shape[1], self.shape[2]
-        else:
-            raise ValueError(f"Expected a shape of lenght 2, 3, or 4, instead got {self.shape}") 
-        
-        x = ops.linspace(x_start, x_end, H)
-        z = ops.linspace(z_start, z_end, W)
-        xv, zv = ops.meshgrid(x, z, indexing='ij')
-        x_flat = ops.reshape(xv, [-1])
-        z_flat = ops.reshape(zv, [-1])
-        y_flat = ops.zeros_like(x_flat)
-        positions = ops.stack([x_flat, y_flat, z_flat], axis=1)
+        rho_range = (
+            self.scan.distance_to_apex,
+            self.scan.rho_range[1],
+        )
+
+        theta_range = (
+            self.scan.polar_angles[0],
+            self.scan.polar_angles[-1],
+        )
+
+        # image shape may be (H,W) or (H,W,1) etc.
+        assert len(self.shape) == 2, f"Shape must be of form H, W, got {self.shape}"
+        H = self.shape[0]
+        W = self.shape[1]
+
+        # 1. Create rho-theta grid
+        rho = ops.linspace(rho_range[0], rho_range[1], H)
+        theta = ops.linspace(theta_range[0], theta_range[1], W)
+
+        #Frustrum rt2xz transformation
+        rho_grid, theta_grid = ops.meshgrid(rho, theta, indexing="ij")
+
+        z_grid = rho_grid / ops.sqrt(1 + ops.tan(theta_grid) ** 2)
+        x_grid = z_grid * ops.tan(theta_grid)  
+        z_grid = z_grid - self.scan.distance_to_apex
+
+        n_pixels = H*W
+        x_vec = ops.reshape(x_grid, (n_pixels,))
+        y_vec = ops.zeros_like(x_vec)
+        z_vec = ops.reshape(z_grid, (n_pixels,))
+
+        positions = ops.stack([x_vec, y_vec, z_vec], axis=1)
         return positions
     
     def img_to_magnitude(self,image):
@@ -288,10 +308,11 @@ class SimulatorPartial(Operator):
             element_angles = jnp.zeros(self.scan.n_el),
             tx_apodizations = jnp.array(self.scan.tx_apodizations),
             initial_times = jnp.array(self.scan.initial_times),
-            element_width_wl = jnp.array(self.scan.element_width),
+            element_width_wl = jnp.array(self.scan.element_width/self.scan.wavelength),
             carrier_frequency = self.scan.center_frequency,
             sampling_frequency = self.scan.sampling_frequency,
             wavefront_only=self.wavefront_only,
+            waveform_samples = jnp.array(self.scan.waveforms_one_way[0]),
             **kwargs
         )
         return (rf_data, ax_indices, el_indices, tx_indices)

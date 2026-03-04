@@ -241,7 +241,7 @@ def simulate_partial_rf_data(
     wavefront_only: bool = False,
     tx_angle_sensitivity: bool = True,
     rx_angle_sensitivity: bool = True,
-    waveform_function: bool = None,
+    waveform_samples = None,
     ax_chunk_size: int = 1024,
     scatterer_chunk_size: int = 1024,
     verbose: bool = False
@@ -310,6 +310,11 @@ def simulate_partial_rf_data(
     selected_apodizations = jnp.take(tx_apodizations, tx_indices, axis=0)
     selected_times = jnp.take(initial_times, tx_indices, axis=0)
 
+    if waveform_samples is not None:
+        waveform_function = get_sampled(waveform_samples, 250e6)
+    else:
+        waveform_function=None
+
     def tx_scan_fn(carry_unused, tx_params):
         t0, apod, t_init = tx_params
         rf = simulate_rf_transmit(
@@ -351,3 +356,48 @@ def get_pulse(carrier_frequency, pulse_width_wl, chirp_rate=0, phase=0):
         y *= jnp.sin(2 * jnp.pi * ((carrier_frequency + (chirp_rate * t_shifted)) * t_shifted) + phase)
         return y
     return waveform_fn
+
+def get_sampled(waveform_samples: jnp.array, sampling_frequency: float):
+    assert isinstance(waveform_samples, (jnp.ndarray)), f"Error, got type {type(waveform_samples)} "
+    assert waveform_samples.ndim == 1
+    assert waveform_samples.dtype in (jnp.float32, jnp.float64)
+
+    waveform_samples = jnp.array(waveform_samples)
+    sampling_frequency = float(sampling_frequency)
+
+    # Pad the waveform samples with a single zero at the beginning and end
+    waveform_samples = jnp.concatenate(
+        [jnp.array([0.0]), waveform_samples, jnp.array([0.0])]
+    )
+
+    n_samples = waveform_samples.shape[0]
+
+    def func_sampled(t: float):
+
+        # Convert time to sample index
+        float_sample = t * sampling_frequency
+
+        # Add one sample to compensate for the padding
+        float_sample += 1
+
+        # Clip the samples to the range of the signal
+        float_sample = jnp.clip(float_sample, 0, n_samples - 1)
+
+        # Convert to integer samples around the float sample
+        n_min = jnp.floor(float_sample).astype(jnp.int32)
+        n_max = jnp.ceil(float_sample).astype(jnp.int32)
+
+        # Get the values of the signal at the integer samples
+        sample_min_a = waveform_samples[n_min]
+        sample_max_a = waveform_samples[n_max]
+
+        # Find the start of the interpolation
+        sample_start = sample_min_a
+        sample_diff = sample_max_a - sample_min_a
+
+        # Interpolate between the two samples
+        interpolated = sample_start + sample_diff * (float_sample - n_min)
+
+        return interpolated
+
+    return func_sampled
