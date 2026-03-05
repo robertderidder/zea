@@ -121,16 +121,10 @@ def simulate_rf(
         # [n_scat, n_txel, rxel]
         dist_total = dist[:, None] + dist[:, :, None]
 
-        # # [n_scat, n_txel, n_rxel]
-        tx_t0_delays = ops.take(t0_delays, tx_idx, axis=0)
-        tx_initial_times = ops.take(initial_times, tx_idx, axis=0)
+        # [n_scat, n_txel, n_rxel]
         tau_total = (
-            (dist_total / sound_speed) + tx_t0_delays[None, :, None] - tx_initial_times
+            (dist_total / sound_speed) + t0_delays[tx_idx][None, :, None] - initial_times[tx_idx]
         )
-        # # [n_scat, n_txel, n_rxel]
-        # tau_total = (
-        #     (dist_total / sound_speed) + t0_delays[tx_idx][None, :, None] - initial_times[tx_idx]
-        # )
 
         scat_pos_relative_to_probe = scatterer_positions[:, None] - probe_geometry[None]
 
@@ -190,12 +184,13 @@ def simulate_rf(
             )
         )
 
+        # Sum over all transmitting elements and scatterers
         result = ops.sum(result, axis=[0, 1])
+
         result = ops.irfft((ops.real(result), ops.imag(result)))
 
         parts.append(result)
 
-    # Stack all transmits: list of [n_el, n_ax] -> [n_tx, n_el, n_ax]
     rf_data = ops.stack(parts, axis=0)
     
     # Add batch and channel dimensions: [n_tx, n_el, n_ax] -> [1, n_tx, n_ax, n_el, 1]
