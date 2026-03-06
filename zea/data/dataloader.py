@@ -23,19 +23,19 @@ Example:
 import os
 import re
 import threading
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from itertools import product
 from pathlib import Path
 from typing import List, Tuple, Union
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 
-import numpy as np
 import keras
-from zea.data.layers import Resizer
+import numpy as np
 
 from zea import log
 from zea.data.datasets import Dataset, H5FileHandleCache, count_samples_per_directory
 from zea.data.file import File
+from zea.data.layers import Resizer
 from zea.data.utils import json_dumps
 from zea.io_lib import retry_on_io_error
 from zea.utils import map_negative_indices
@@ -224,7 +224,7 @@ class H5Generator(Dataset):
         sort_files: bool = True,
         overlapping_blocks: bool = False,
         initial_frame_axis: int = 0,
-        insert_frame_axis: bool = True,
+        insert_frame_axis: bool = False,
         frame_index_stride: int = 1,
         frame_axis: int = -1,
         validate: bool = True,
@@ -498,9 +498,9 @@ class H5DataSource:
         assert self.n_frames > 0, f"`n_frames` must be > 0, got {self.n_frames}"
 
         # Discover files and shapes (reuses Dataset machinery)
-        _dataset = Dataset(file_paths, key, validate=validate, **kwargs)
+        _dataset = Dataset(file_paths, validate=validate, **kwargs)
         self.file_paths = _dataset.file_paths
-        self.file_shapes = _dataset.file_shapes
+        self.file_shapes = _dataset.load_file_shapes(key)
         _dataset.close()
 
         # Compute per-sample index table
@@ -595,6 +595,7 @@ class H5DataSource:
         cache = getattr(self._local, "cache", None)
         if cache is not None:
             cache.close()
+
 
 # ── Keras GPU transforms (layers + ops) ──────────────────────────────────────
 
@@ -771,6 +772,7 @@ class _PrefetchToDevice:
         future = self._buffer.popleft()
         return future.result()
 
+
 class Dataloader:
     """High-performance HDF5 dataloader built on `Grain <https://github.com/google/grain>`_.
 
@@ -853,7 +855,7 @@ class Dataloader:
         overlapping_blocks: bool = False,
         augmentation: callable = None,
         initial_frame_axis: int = 0,
-        insert_frame_axis: bool = True,
+        insert_frame_axis: bool = False,
         frame_index_stride: int = 1,
         frame_axis: int = -1,
         validate: bool = True,
@@ -968,10 +970,8 @@ class Dataloader:
         )
 
         if device is not None or gpu_transform_fn is not None:
-            return _PrefetchToDevice(
-                it, device=device, gpu_transform=gpu_transform_fn
-            )
-        return it
+            return _PrefetchToDevice(it, device=device, gpu_transform=gpu_transform_fn)
+        return iter(it)
 
     def __len__(self):
         """Number of batches (or samples if unbatched)."""
