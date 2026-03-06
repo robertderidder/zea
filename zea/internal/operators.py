@@ -17,6 +17,7 @@ from zea.func import translate
 from zea.simulate_partial import simulate_partial_rf_data
 from zea.simulator_jax import simulate_partial_rf_data as sim_jax
 from zea.display import scan_convert, compute_scan_convert_2d_coordinates
+from zea.ops import Simulate
 
 class Operator(abc.ABC, Object):
     """Operator base class.
@@ -208,10 +209,10 @@ class SimulatorPartial(Operator):
     Operator for simulating RF data from an image.
     The operator is initialized with fixed scan parameters.
     The forward operator takes a logcompressed image, normalized between -1 and 1
-    It is then translated to dynamic range and log uncompressed and generates rf_datawaveform_one_way.png waveform_two_way.png
+    It is then translated to dynamic range and log uncompressed and generates rf_data
     """
 
-    def __init__(self, scan, shape, n_ax_samples=10, n_el_samples=10, n_tx_samples=None,dynamic_range = (-40,0), wavefront_only=False):
+    def __init__(self, scan, shape, n_ax_samples=10, n_el_samples=10, n_tx_samples=None, wavefront_only=False):
         super().__init__()
         self.scan = scan
         self.shape = shape
@@ -219,7 +220,6 @@ class SimulatorPartial(Operator):
         self.n_ax_samples = n_ax_samples
         self.n_el_samples = n_el_samples
         self.n_tx_samples = n_tx_samples
-        self.dynamic_range = dynamic_range
         self.wavefront_only = wavefront_only
 
     def compute_scatterer_positions(self):
@@ -272,7 +272,7 @@ class SimulatorPartial(Operator):
         return positions
     
     def img_to_magnitude(self,image):
-        image = translate(image, range_from = (-1,1), range_to=self.dynamic_range)
+        image = translate(image, range_from = (-1,1), range_to=self.scan.dynamic_range)
         image_lin = 10**(image/20)
         return image_lin
 
@@ -322,3 +322,110 @@ class SimulatorPartial(Operator):
 
     def __str__(self):
         return f"SimulateOperator implemented in jax"
+
+
+class SimulatorPartialFFT(Operator):
+    def __init__(self, scan, n_el_samples = 10, n_freq_samples = 10, n_tx_samples = 5, wavefront_only=False):
+        super().__init__()
+        self.scan = scan
+        self.n_el_samples = n_el_samples,
+        self.n_freq_samples = n_freq_samples,
+        self.n_tx_samples = n_tx_samples,
+        self.n_freqs = 2**(jnp.ceil(jnp.log2(self.scan.n_ax))) // 2 + 1
+        self.wavefront_only = wavefront_only
+        self.simulator = Simulate(jit_compile = True, with_batch_dim = False)
+        self.positions = self.compute_scatterer_positions(scan)
+
+    def fit_point_scatterers(image):
+        """
+        does this make sens? sampling at every iteration seems wasetful. initializing once, and updating along with amplitudes seems better.
+        In that case I would only have to sample from the initial guess which is the tweedy estimate
+        https://github.com/tue-bmd/Bayesian-REFoCUS/blob/echonetlvh/simulation/fit_point_scatterers.py
+        """
+        return 0
+    
+    def img_to_magnitude(self,image):
+        image = translate(image, range_from = (-1,1), range_to=self.scan.dynamic_range)
+        image_lin = 10**(image/20)
+        return image_lin
+    
+    def compute_scatterer_positions(self):
+        """
+        Computes the Cartesian coordinates of every scatterer (pixel) in the
+        polar image that the operator is initialised with.
+
+        The input image is assumed to live in ρ–θ space; the rows correspond to
+        radial samples between ``scan.rho_range`` and the columns to angles
+        between the first and last value of ``scan.polar_angles``.  The
+        transformation performed here is identical to the one performed by
+        :func:`zea.display.scan_convert_2d` when it is used with the same
+        scan parameters; this means that the positions returned here are the
+        physical (x,y,z) locations beneath the probe.  Only the x and z
+        components are passed to the JAX simulator – the y coordinate is
+        zero.
+        """
+        rho_range = (
+            self.scan.distance_to_apex,
+            self.scan.rho_range[1],
+        )
+
+        theta_range = (
+            self.scan.polar_angles[0],
+            self.scan.polar_angles[-1],
+        )
+
+        # image shape may be (H,W) or (H,W,1) etc.
+        assert len(self.shape) == 2, f"Shape must be of form H, W, got {self.shape}"
+        H = self.shape[0]
+        W = self.shape[1]
+
+        # 1. Create rho-theta grid
+        rho = ops.linspace(rho_range[0], rho_range[1], H)
+        theta = ops.linspace(theta_range[0], theta_range[1], W)
+
+        #Frustrum rt2xz transformation
+        rho_grid, theta_grid = ops.meshgrid(rho, theta, indexing="ij")
+
+        z_grid = rho_grid / ops.sqrt(1 + ops.tan(theta_grid) ** 2)
+        x_grid = z_grid * ops.tan(theta_grid)  
+        z_grid = z_grid - self.scan.distance_to_apex
+
+        n_pixels = H*W
+        x_vec = ops.reshape(x_grid, (n_pixels,))
+        y_vec = ops.zeros_like(x_vec)
+        z_vec = ops.reshape(z_grid, (n_pixels,))
+
+        positions = ops.stack([x_vec, y_vec, z_vec], axis=1)
+        return positions
+    
+    def forward(self,image, seed):
+        n_frames, *img_shape = image.shape
+        magnitudes = self.img_to_magnitude(image)
+        magnitudes = ops.reshape(magnitudes, (n_frames, -1))
+
+        el_indices = jax.random.choice(seed,self.scan.n_el,(self.n_el_samples,),replace=False)
+        freq_indices = jax.random.choice(seed,self.n_freqs,(self.n_freq_samples,),replace=False)
+        tx_indices = jax.random.choice(seed,self.scan.n_tx,(self.n_tx_samples,),replace=False)
+
+        el_indices = jax.numpy.sort(el_indices)
+        freq_indices = jax.numpy.sort(freq_indices)
+        tx_indices = jax.numpy.sort(tx_indices)
+    
+        #If neccessry implement for-loop with chunks
+        rf = self.simulator(
+                scatterer_positions=    self.positions, 
+                scatterer_magnitudes = magnitudes,
+                probe_geometry =        self.scan.probe_geometry,
+                apply_lens_correction = self.scan.apply_lens_correction,
+                sound_speed =           self.scan.sound_speed,
+                lens_sound_speed =      self.scan.lens_sound_speed,
+                lens_thickness =        self.scan.lens_thickness,
+                n_ax =                  self.scan.n_ax,
+                center_frequency =      self.scan.center_frequency,
+                sampling_frequency=     self.scan.sampling_frequency,
+                t0_delays =             self.scan.t0_delays,
+                initial_times=          self.scan.initial_times,
+                element_width=          self.scan.element_width,
+                attenuation_coef=       self.scan.attenuation_coef,
+                tx_apodizations=        self.scan.tx_apodizations,)
+        return rf

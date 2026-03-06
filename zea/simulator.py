@@ -187,16 +187,16 @@ def simulate_rf(
         # Sum over all transmitting elements and scatterers
         result = ops.sum(result, axis=[0, 1])
 
-        result = ops.irfft((ops.real(result), ops.imag(result)))
+        # result = ops.irfft((ops.real(result), ops.imag(result)))
 
         parts.append(result)
 
     rf_data = ops.stack(parts, axis=0)
     
     # Add batch and channel dimensions: [n_tx, n_el, n_ax] -> [1, n_tx, n_ax, n_el, 1]
-    rf_data = ops.transpose(rf_data, (0, 2, 1))
-    rf_data = rf_data[..., None]
-    rf_data = rf_data[:, :n_ax, :, :]
+    # rf_data = ops.transpose(rf_data, (0, 2, 1))
+    # rf_data = rf_data[..., None]
+    # rf_data = rf_data[:, :n_ax, :, :]
     return rf_data
 
 
