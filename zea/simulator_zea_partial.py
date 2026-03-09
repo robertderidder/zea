@@ -50,6 +50,9 @@ from zea.beamform.lens_correction import compute_lens_corrected_travel_times
 def simulate_rf(
     scatterer_positions,
     scatterer_magnitudes,
+    el_indices,
+    freq_indices,
+    tx_indices,
     probe_geometry,
     apply_lens_correction,
     lens_thickness,
@@ -90,7 +93,7 @@ def simulate_rf(
         rf_data (array-like): The simulated RF data of shape (n_tx, n_ax, n_el, 1).
     """
 
-    n_tx = t0_delays.shape[0]
+    probe_geometry = ops.take(probe_geometry, el_indices, axis=0)
 
     pulse_spectrum_fn = get_pulse_spectrum_fn(center_frequency, n_period=4)
 
@@ -112,10 +115,12 @@ def simulate_rf(
     n_ax_rounded = _round_up_to_power_of_two(int(n_ax)).astype("float32")
 
     freqs = ops.arange(n_ax_rounded // 2 + 1, dtype="float32") / n_ax_rounded * sampling_frequency
+    freqs = ops.take(freqs, freq_indices)
 
     waveform_spectrum = pulse_spectrum_fn(freqs)
     parts = []
-    for tx in range(n_tx):
+
+    for tx in tx_indices:
         tx_idx = ops.array(tx)
 
         # [n_scat, n_txel, rxel]
@@ -187,14 +192,15 @@ def simulate_rf(
         # Sum over all transmitting elements and scatterers
         result = ops.sum(result, axis=[0, 1])
 
-        result = ops.irfft((ops.real(result), ops.imag(result)))
+        # result = ops.irfft((ops.real(result), ops.imag(result)))
 
         parts.append(result)
 
     rf_data = ops.stack(parts, axis=0)
-    rf_data = ops.transpose(rf_data, (0, 2, 1))
-    rf_data = rf_data[..., None]
-    rf_data = rf_data[:, :n_ax, :, :]
+    
+    # Add batch and channel dimensions: [n_tx, n_el, n_ax] -> [1, n_tx, n_ax, n_el, 1]
+    rf_data = ops.transpose(rf_data, (0, 2, 1))[...,None]
+    # rf_data = rf_data[:, :n_ax, :, :]
     return rf_data
 
 

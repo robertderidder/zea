@@ -5,6 +5,7 @@ Handles task-dependent operations (A) and noises (n) to simulate a measurement y
 """
 
 import abc
+import zea
 
 import numpy as np
 from keras import ops
@@ -17,7 +18,8 @@ from zea.func import translate
 from zea.simulate_partial import simulate_partial_rf_data
 from zea.simulator_jax import simulate_partial_rf_data as sim_jax
 from zea.display import scan_convert, compute_scan_convert_2d_coordinates
-from zea.ops import Simulate
+
+from zea.simulator_zea_partial import simulate_rf
 
 class Operator(abc.ABC, Object):
     """Operator base class.
@@ -333,7 +335,7 @@ class SimulatorPartialFFT(Operator):
         self.n_tx_samples = n_tx_samples,
         self.n_freqs = 2**(jnp.ceil(jnp.log2(self.scan.n_ax))) // 2 + 1
         self.wavefront_only = wavefront_only
-        self.simulator = Simulate(jit_compile = True, with_batch_dim = False)
+        # self.simulator = (jit_compile = True, with_batch_dim = False)
         self.positions = self.compute_scatterer_positions(scan)
 
     def fit_point_scatterers(image):
@@ -365,7 +367,7 @@ class SimulatorPartialFFT(Operator):
         zero.
         """
         rho_range = (
-            self.scan.distance_to_apex,
+            self.scan.rho_range[0],
             self.scan.rho_range[1],
         )
 
@@ -403,18 +405,21 @@ class SimulatorPartialFFT(Operator):
         magnitudes = self.img_to_magnitude(image)
         magnitudes = ops.reshape(magnitudes, (n_frames, -1))
 
-        el_indices = jax.random.choice(seed,self.scan.n_el,(self.n_el_samples,),replace=False)
-        freq_indices = jax.random.choice(seed,self.n_freqs,(self.n_freq_samples,),replace=False)
-        tx_indices = jax.random.choice(seed,self.scan.n_tx,(self.n_tx_samples,),replace=False)
+        el_indices = ops.take(ops.random.permutation(ops.arange(self.scan.n_el), seed=seed), ops.arange(self.n_el_samples))
+        freq_indices = ops.take(ops.random.permutation(ops.arange(self.n_freq), seed=seed), ops.arange(self.n_freq_samples))
+        tx_indices = ops.take(ops.random.permutation(ops.arange(self.scan.n_tx), seed=seed), ops.arange(self.n_tx_samples))
 
-        el_indices = jax.numpy.sort(el_indices)
-        freq_indices = jax.numpy.sort(freq_indices)
-        tx_indices = jax.numpy.sort(tx_indices)
-    
-        #If neccessry implement for-loop with chunks
-        rf = self.simulator(
+        el_indices = ops.sort(el_indices)
+        freq_indices = ops.sort(freq_indices)
+        tx_indices = ops.sort(tx_indices)
+
+        #If neccessry implement for-loop with chunks        
+        rf = simulate_rf(
                 scatterer_positions=    self.positions, 
-                scatterer_magnitudes = magnitudes,
+                scatterer_magnitudes =  magnitudes,
+                el_indices=             el_indices,
+                freq_indices=           freq_indices,
+                tx_indices=             tx_indices,
                 probe_geometry =        self.scan.probe_geometry,
                 apply_lens_correction = self.scan.apply_lens_correction,
                 sound_speed =           self.scan.sound_speed,
@@ -428,4 +433,4 @@ class SimulatorPartialFFT(Operator):
                 element_width=          self.scan.element_width,
                 attenuation_coef=       self.scan.attenuation_coef,
                 tx_apodizations=        self.scan.tx_apodizations,)
-        return rf
+        return rf, el_indices, freq_indices, tx_indices
