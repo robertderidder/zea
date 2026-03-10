@@ -68,7 +68,8 @@ def simulate_rf(
     tx_apodizations,
 ):
     """
-    Simulates RF data for a given set of scatterers.
+    Simulates a select number of rf_data points in the frequency domain for a given set of scatterers and probe geometry. 
+    
 
     Args:
         scatterer_positions (array-like): The positions of the scatterers [m] of shape (n_scat, 3).
@@ -90,19 +91,38 @@ def simulate_rf(
             shape (n_tx, n_el).
 
     Returns:
-        rf_data (array-like): The simulated RF data of shape (n_tx, n_ax, n_el, 1).
+        fourier transform of the RF data of shape (n_tx, n_freq, n_el)
     """
 
-    probe_geometry = ops.take(probe_geometry, el_indices, axis=0)
+    probe_geometry_tx = probe_geometry
+    probe_geometry_rx = ops.take(probe_geometry, el_indices, axis=0)
+
+    t0_delays = ops.take(t0_delays, tx_indices, axis=0)
+
+    initial_times = ops.take(initial_times, tx_indices, axis=0)
+
+    tx_apodizations = ops.take(tx_apodizations, tx_indices, axis=0)
 
     pulse_spectrum_fn = get_pulse_spectrum_fn(center_frequency, n_period=4)
 
     if not apply_lens_correction:
-        dist = ops.linalg.norm(probe_geometry[None] - scatterer_positions[:, None], axis=-1)
+        dist_tx = ops.linalg.norm(probe_geometry_tx[None] - scatterer_positions[:, None], axis=-1)
+        dist_rx = ops.linalg.norm(probe_geometry_rx[None] - scatterer_positions[:, None], axis=-1)
     else:
-        dist = (
+        dist_tx = (
             compute_lens_corrected_travel_times(
-                probe_geometry,
+                probe_geometry_tx,
+                scatterer_positions,
+                lens_thickness=lens_thickness,
+                c_lens=lens_sound_speed,
+                c_medium=sound_speed,
+                n_iter=3,
+            )
+            * sound_speed
+        )
+        dist_rx = (
+            compute_lens_corrected_travel_times(
+                probe_geometry_rx,
                 scatterer_positions,
                 lens_thickness=lens_thickness,
                 c_lens=lens_sound_speed,
@@ -120,44 +140,53 @@ def simulate_rf(
     waveform_spectrum = pulse_spectrum_fn(freqs)
     parts = []
 
-    for tx in tx_indices:
+    for tx in range(len(tx_indices)):
         tx_idx = ops.array(tx)
 
         # [n_scat, n_txel, rxel]
-        dist_total = dist[:, None] + dist[:, :, None]
+        dist_total = dist_tx[:, :, None] + dist_rx[:, None, :]
 
         # [n_scat, n_txel, n_rxel]
         tau_total = (
             (dist_total / sound_speed) + t0_delays[tx_idx][None, :, None] - initial_times[tx_idx]
         )
 
-        scat_pos_relative_to_probe = scatterer_positions[:, None] - probe_geometry[None]
+        scat_pos_relative_to_probe_tx = scatterer_positions[:, None] - probe_geometry_tx[None]
+        scat_pos_relative_to_probe_rx = scatterer_positions[:, None] - probe_geometry_rx[None]
 
         # Compute 3D directivity
-        theta = ops.arctan2(
-            scat_pos_relative_to_probe[:, :, 0], scat_pos_relative_to_probe[:, :, 2]
+        theta_tx = ops.arctan2(
+            scat_pos_relative_to_probe_tx[:, :, 0], scat_pos_relative_to_probe_tx[:, :, 2]
         )
-        phi = ops.arctan2(scat_pos_relative_to_probe[:, :, 1], scat_pos_relative_to_probe[:, :, 2])
+        phi_tx = ops.arctan2(
+            scat_pos_relative_to_probe_tx[:, :, 1], scat_pos_relative_to_probe_tx[:, :, 2]
+        )
+        theta_rx = ops.arctan2(
+            scat_pos_relative_to_probe_rx[:, :, 0], scat_pos_relative_to_probe_rx[:, :, 2]
+        )
+        phi_rx = ops.arctan2(
+            scat_pos_relative_to_probe_rx[:, :, 1], scat_pos_relative_to_probe_rx[:, :, 2]
+        )
 
         directivity_tx = directivity(
             freqs[None, None, None],
-            theta[..., None, None],
+            theta_tx[..., None, None],
             element_width,
             sound_speed,
         ) * directivity(
             freqs[None, None, None],
-            phi[..., None, None],
+            phi_tx[..., None, None],
             element_width,
             sound_speed,
         )
         directivity_rx = directivity(
             freqs[None, None, None],
-            theta[:, None, :, None],
+            theta_rx[:, None, :, None],
             element_width,
             sound_speed,
         ) * directivity(
             freqs[None, None, None],
-            phi[:, None, :, None],
+            phi_rx[:, None, :, None],
             element_width,
             sound_speed,
         )
@@ -200,9 +229,7 @@ def simulate_rf(
     
     # Add batch and channel dimensions: [n_tx, n_el, n_ax] -> [1, n_tx, n_ax, n_el, 1]
     rf_data = ops.transpose(rf_data, (0, 2, 1))[...,None]
-    # rf_data = rf_data[:, :n_ax, :, :]
     return rf_data
-
 
 def directivity(f, theta, element_width, sound_speed, rigid_baffle=True):
     """Computes the directivity of a single element.

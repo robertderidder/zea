@@ -21,9 +21,6 @@ def _get_vectorized_simulate_function(
     initial_time,
     element_width_wl,
     sampling_frequency,
-    apply_lens_correction,
-    lens_sound_speed,
-    lens_thickness,
     sound_speed,
     attenuation_coefficient,
     waveform_function,
@@ -40,22 +37,14 @@ def _get_vectorized_simulate_function(
         sampling_period = 1 / sampling_frequency
         rx_element_pos = probe_geometry[element_index]
         t_sample = ax_index * sampling_period
-
-        d_rx = jnp.linalg.norm(scatterer_position - rx_element_pos)
-        t_rx = d_rx / sound_speed
+        t_rx = jnp.linalg.norm(scatterer_position - rx_element_pos) / sound_speed
         
-
-        d_tx = jnp.linalg.norm(probe_geometry - scatterer_position[None, :], axis=1)
         t_tx = (
-            d_tx
+            jnp.linalg.norm(probe_geometry - scatterer_position[None, :], axis=1)
             / sound_speed
             + t0_delays
         )
-        def spread(d, mindist=1e-4):
-            return mindist/jnp.maximum(d, mindist)
-        
-        spread_tot = spread(d_rx)*spread(d_tx)
-        
+
         delay = t_rx + t_tx
 
         if wavefront_only:
@@ -94,7 +83,6 @@ def _get_vectorized_simulate_function(
             * angular_response_tx
             * angular_response_rx
             * attenuation
-            * spread_tot
         )
 
         return jnp.sum(response)
@@ -119,9 +107,6 @@ def simulate_rf_transmit(
     element_width_wl: float,
     sampling_frequency: Union[float, int],
     carrier_frequency: Union[float, int],
-    apply_lens_correction: bool = False,
-    lens_sound_speed: Union[float, int] = 1000,
-    lens_thickness: Union[float, int] = 1e-3,
     sound_speed: Union[float, int] = 1540,
     attenuation_coefficient: Union[float, int] = 0.0,
     wavefront_only: bool = False,
@@ -158,9 +143,6 @@ def simulate_rf_transmit(
         initial_time, 
         element_width_wl, 
         sampling_frequency,
-        apply_lens_correction,
-        lens_sound_speed,
-        lens_thickness,
         sound_speed, 
         att_neper_m, 
         tx_waveform,
@@ -255,9 +237,6 @@ def simulate_partial_rf_data(
     element_width_wl: float,
     sampling_frequency: Union[float, int],
     carrier_frequency: Union[float, int],
-    apply_lens_correction: bool = False,
-    lens_sound_speed: Union[float, int] = 1000,
-    lens_thickness: Union[float, int] = 1e-3,
     sound_speed: Union[float, int] = 1540,
     attenuation_coefficient: Union[float, int] = 0.0,
     wavefront_only: bool = False,
@@ -351,9 +330,6 @@ def simulate_partial_rf_data(
             element_width_wl, 
             sampling_frequency, 
             carrier_frequency,
-            apply_lens_correction,
-            lens_sound_speed,
-            lens_thickness,
             sound_speed, 
             attenuation_coefficient, 
             wavefront_only,

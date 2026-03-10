@@ -8,13 +8,14 @@ import abc
 import zea
 
 import numpy as np
+import keras
 from keras import ops
 import jax
 import jax.numpy as jnp
 
 from zea.internal.core import Object
 from zea.internal.registry import operator_registry
-from zea.func import translate
+from zea.func import translate, fori_loop
 from zea.simulate_partial import simulate_partial_rf_data
 from zea.simulator_jax import simulate_partial_rf_data as sim_jax
 from zea.display import scan_convert, compute_scan_convert_2d_coordinates
@@ -239,38 +240,63 @@ class SimulatorPartial(Operator):
         components are passed to the JAX simulator – the y coordinate is
         zero.
         """
-        rho_range = (
-            self.scan.distance_to_apex,
-            self.scan.rho_range[1],
-        )
+        if self.scan.grid_type == "polar":
+            rho_range = (
+                self.scan.rho_range,
+            )
 
-        theta_range = (
-            self.scan.polar_angles[0],
-            self.scan.polar_angles[-1],
-        )
+            theta_range = (
+                self.scan.polar_angles[0],
+                self.scan.polar_angles[-1],
+            )
 
-        # image shape may be (H,W) or (H,W,1) etc.
-        assert len(self.shape) == 2, f"Shape must be of form H, W, got {self.shape}"
-        H = self.shape[0]
-        W = self.shape[1]
+            # image shape may be (H,W) or (H,W,1) etc.
+            assert len(self.shape) == 2, f"Shape must be of form H, W, got {self.shape}"
+            H = self.shape[0]
+            W = self.shape[1]
 
-        # 1. Create rho-theta grid
-        rho = ops.linspace(rho_range[0], rho_range[1], H)
-        theta = ops.linspace(theta_range[0], theta_range[1], W)
+            # 1. Create rho-theta grid
+            rho = ops.linspace(rho_range[0], rho_range[1], H)
+            theta = ops.linspace(theta_range[0], theta_range[1], W)
 
-        #Frustrum rt2xz transformation
-        rho_grid, theta_grid = ops.meshgrid(rho, theta, indexing="ij")
+            #Frustrum rt2xz transformation
+            rho_grid, theta_grid = ops.meshgrid(rho, theta, indexing="ij")
 
-        z_grid = rho_grid / ops.sqrt(1 + ops.tan(theta_grid) ** 2)
-        x_grid = z_grid * ops.tan(theta_grid)  
-        z_grid = z_grid - self.scan.distance_to_apex
+            z_grid = rho_grid / ops.sqrt(1 + ops.tan(theta_grid) ** 2)
+            x_grid = z_grid * ops.tan(theta_grid)  
+            z_grid = z_grid - self.scan.distance_to_apex
 
-        n_pixels = H*W
-        x_vec = ops.reshape(x_grid, (n_pixels,))
-        y_vec = ops.zeros_like(x_vec)
-        z_vec = ops.reshape(z_grid, (n_pixels,))
+            n_pixels = H*W
+            x_vec = ops.reshape(x_grid, (n_pixels,))
+            y_vec = ops.zeros_like(x_vec)
+            z_vec = ops.reshape(z_grid, (n_pixels,))
 
-        positions = ops.stack([x_vec, y_vec, z_vec], axis=1)
+            positions = ops.stack([x_vec, y_vec, z_vec], axis=1)
+        elif self.scan.grid_type == "cartesian":
+            """
+            Compute scatterer positions for each pixel in the image, using scan x/z limits and image shape.
+            Returns an array of shape (n_pixels, 3) with [x, y, z] positions.
+            """
+            x_start, x_end = self.scan.xlims
+            z_start, z_end = self.scan.zlims
+            if len(self.shape) == 2:
+                H, W = self.shape[0], self.shape[1]
+            elif len(self.shape) == 3:
+                H, W = self.shape[0], self.shape[1]
+            elif len(self.shape) == 4:
+                B, H, W = self.shape[0], self.shape[1], self.shape[2]
+            else:
+                raise ValueError(f"Expected a shape of lenght 2, 3, or 4, instead got {self.shape}") 
+            
+            x = ops.linspace(x_start, x_end, H)
+            z = ops.linspace(z_start, z_end, W)
+            xv, zv = ops.meshgrid(x, z, indexing='ij')
+            x_flat = ops.reshape(xv, [-1])
+            z_flat = ops.reshape(zv, [-1])
+            y_flat = ops.zeros_like(x_flat)
+            positions = ops.stack([x_flat, y_flat, z_flat], axis=1)
+        else:
+            raise ValueError(f"Invalid grid type {self.scan.grid_type}. Expected 'polar' or 'cartesian'.")
         return positions
     
     def img_to_magnitude(self,image):
@@ -314,10 +340,10 @@ class SimulatorPartial(Operator):
             carrier_frequency = self.scan.center_frequency,
             sampling_frequency = self.scan.sampling_frequency,
             wavefront_only=self.wavefront_only,
-            waveform_samples = jnp.array(self.scan.waveforms_one_way[0]),
+            waveform_samples = None,
             **kwargs
         )
-        return (rf_data, ax_indices, el_indices, tx_indices)
+        return (rf_data, tx_indices, ax_indices, el_indices)
     
     def transpose(self):
         raise NotImplementedError("Transpose for SimulateOperatorJaxus is not implemented.")
@@ -327,16 +353,17 @@ class SimulatorPartial(Operator):
 
 
 class SimulatorPartialFFT(Operator):
-    def __init__(self, scan, n_el_samples = 10, n_freq_samples = 10, n_tx_samples = 5, wavefront_only=False):
+    def __init__(self, scan, shape, n_el_samples = 10, n_freq_samples = 10, n_tx_samples = 5, wavefront_only=False, scatterer_chunk_size = 32):
         super().__init__()
         self.scan = scan
-        self.n_el_samples = n_el_samples,
-        self.n_freq_samples = n_freq_samples,
-        self.n_tx_samples = n_tx_samples,
+        self.shape = shape
+        self.n_el_samples = n_el_samples
         self.n_freqs = 2**(jnp.ceil(jnp.log2(self.scan.n_ax))) // 2 + 1
+        self.n_freq_samples = n_freq_samples
+        self.n_tx_samples = n_tx_samples
         self.wavefront_only = wavefront_only
-        # self.simulator = (jit_compile = True, with_batch_dim = False)
-        self.positions = self.compute_scatterer_positions(scan)
+        self.positions = self.compute_scatterer_positions()
+        self.scatterer_chunk_size = scatterer_chunk_size
 
     def fit_point_scatterers(image):
         """
@@ -366,38 +393,63 @@ class SimulatorPartialFFT(Operator):
         components are passed to the JAX simulator – the y coordinate is
         zero.
         """
-        rho_range = (
-            self.scan.rho_range[0],
-            self.scan.rho_range[1],
-        )
+        if self.scan.grid_type == "polar":
+            rho_range = (
+                self.scan.rho_range,
+            )
 
-        theta_range = (
-            self.scan.polar_angles[0],
-            self.scan.polar_angles[-1],
-        )
+            theta_range = (
+                self.scan.polar_angles[0],
+                self.scan.polar_angles[-1],
+            )
 
-        # image shape may be (H,W) or (H,W,1) etc.
-        assert len(self.shape) == 2, f"Shape must be of form H, W, got {self.shape}"
-        H = self.shape[0]
-        W = self.shape[1]
+            # image shape may be (H,W) or (H,W,1) etc.
+            assert len(self.shape) == 2, f"Shape must be of form H, W, got {self.shape}"
+            H = self.shape[0]
+            W = self.shape[1]
 
-        # 1. Create rho-theta grid
-        rho = ops.linspace(rho_range[0], rho_range[1], H)
-        theta = ops.linspace(theta_range[0], theta_range[1], W)
+            # 1. Create rho-theta grid
+            rho = ops.linspace(rho_range[0], rho_range[1], H)
+            theta = ops.linspace(theta_range[0], theta_range[1], W)
 
-        #Frustrum rt2xz transformation
-        rho_grid, theta_grid = ops.meshgrid(rho, theta, indexing="ij")
+            #Frustrum rt2xz transformation
+            rho_grid, theta_grid = ops.meshgrid(rho, theta, indexing="ij")
 
-        z_grid = rho_grid / ops.sqrt(1 + ops.tan(theta_grid) ** 2)
-        x_grid = z_grid * ops.tan(theta_grid)  
-        z_grid = z_grid - self.scan.distance_to_apex
+            z_grid = rho_grid / ops.sqrt(1 + ops.tan(theta_grid) ** 2)
+            x_grid = z_grid * ops.tan(theta_grid)  
+            z_grid = z_grid - self.scan.distance_to_apex
 
-        n_pixels = H*W
-        x_vec = ops.reshape(x_grid, (n_pixels,))
-        y_vec = ops.zeros_like(x_vec)
-        z_vec = ops.reshape(z_grid, (n_pixels,))
+            n_pixels = H*W
+            x_vec = ops.reshape(x_grid, (n_pixels,))
+            y_vec = ops.zeros_like(x_vec)
+            z_vec = ops.reshape(z_grid, (n_pixels,))
 
-        positions = ops.stack([x_vec, y_vec, z_vec], axis=1)
+            positions = ops.stack([x_vec, y_vec, z_vec], axis=1)
+        elif self.scan.grid_type == "cartesian":
+            """
+            Compute scatterer positions for each pixel in the image, using scan x/z limits and image shape.
+            Returns an array of shape (n_pixels, 3) with [x, y, z] positions.
+            """
+            x_start, x_end = self.scan.xlims
+            z_start, z_end = self.scan.zlims
+            if len(self.shape) == 2:
+                H, W = self.shape[0], self.shape[1]
+            elif len(self.shape) == 3:
+                H, W = self.shape[0], self.shape[1]
+            elif len(self.shape) == 4:
+                B, H, W = self.shape[0], self.shape[1], self.shape[2]
+            else:
+                raise ValueError(f"Expected a shape of lenght 2, 3, or 4, instead got {self.shape}") 
+            
+            x = ops.linspace(x_start, x_end, H)
+            z = ops.linspace(z_start, z_end, W)
+            xv, zv = ops.meshgrid(x, z, indexing='ij')
+            x_flat = ops.reshape(xv, [-1])
+            z_flat = ops.reshape(zv, [-1])
+            y_flat = ops.zeros_like(x_flat)
+            positions = ops.stack([x_flat, y_flat, z_flat], axis=1)
+        else:
+            raise ValueError(f"Invalid grid type {self.scan.grid_type}. Expected 'polar' or 'cartesian'.")
         return positions
     
     def forward(self,image, seed):
@@ -405,32 +457,98 @@ class SimulatorPartialFFT(Operator):
         magnitudes = self.img_to_magnitude(image)
         magnitudes = ops.reshape(magnitudes, (n_frames, -1))
 
-        el_indices = ops.take(ops.random.permutation(ops.arange(self.scan.n_el), seed=seed), ops.arange(self.n_el_samples))
-        freq_indices = ops.take(ops.random.permutation(ops.arange(self.n_freq), seed=seed), ops.arange(self.n_freq_samples))
-        tx_indices = ops.take(ops.random.permutation(ops.arange(self.scan.n_tx), seed=seed), ops.arange(self.n_tx_samples))
+        seed, el_seed, tx_seed, freq_seed = jax.random.split(seed, 4)
+        
+        el_indices = jax.random.choice(el_seed, self.scan.n_el, (self.n_el_samples,), replace=False)
+        tx_indices = jax.random.choice(tx_seed, self.scan.n_tx, (self.n_tx_samples,), replace=False)
 
-        el_indices = ops.sort(el_indices)
-        freq_indices = ops.sort(freq_indices)
-        tx_indices = ops.sort(tx_indices)
+        # Sample frequencies with Gaussian weighting centered at carrier frequency
+        freq_bins = jnp.arange(self.n_freqs, dtype=jnp.float32)
+        std_bins = self.n_freqs // 8
+        probs = jnp.exp(-0.5 * ((freq_bins - self.n_freqs/2) / std_bins) ** 2)
+        probs = probs / probs.sum()
+        
+        freq_indices = jax.random.choice(freq_seed, self.n_freqs, (self.n_freq_samples,),replace=False)
+        
+        el_indices = jax.numpy.sort(el_indices)
+        freq_indices = jax.numpy.sort(freq_indices)
+        tx_indices = jax.numpy.sort(tx_indices)
+        
+        # Compute scatterer padding for chunking
+        n_scat = self.positions.shape[0]
+        chunk_size = self.scatterer_chunk_size
+        n_scat_padded = n_scat + (chunk_size - (n_scat % chunk_size)) % chunk_size
+        
+        # Pad positions and use frame loop
+        positions_padded = ops.pad(
+            self.positions, 
+            ((0, n_scat_padded - n_scat), (0, 0))
+        )
+        
+        def process_frame(frame_idx, rf_data_all):
+            """Process one frame by looping over scatterer chunks."""
+            amplitudes = magnitudes[frame_idx]
+            
+            # Pad amplitudes for chunking
+            amplitudes_padded = ops.pad(
+                amplitudes,
+                (0, n_scat_padded - n_scat)
+            )
+            
+            # Initialize accumulated RF for this frame
+            rf_accum = ops.zeros([self.n_tx_samples, self.n_freq_samples, self.n_el_samples, 1], dtype='complex64')
+            
+            def process_scat_chunk(chunk_idx, rf_acc):
+                """Process one scatterer chunk and accumulate."""
+                start = chunk_idx * chunk_size
+                
+                scat_chunk = ops.slice(positions_padded, (start, 0), (chunk_size, 3))
+                amp_chunk = ops.slice(amplitudes_padded, (start,), (chunk_size,))
+                
+                rf_chunk = simulate_rf(
+                        scatterer_positions=scat_chunk,
+                        scatterer_magnitudes=amp_chunk,
+                        el_indices=el_indices,
+                        freq_indices=freq_indices,
+                        tx_indices=tx_indices,
+                        probe_geometry=self.scan.probe_geometry,
+                        apply_lens_correction=self.scan.apply_lens_correction,
+                        sound_speed=self.scan.sound_speed,
+                        lens_sound_speed=self.scan.lens_sound_speed,
+                        lens_thickness=self.scan.lens_thickness,
+                        n_ax=self.scan.n_ax,
+                        center_frequency=self.scan.center_frequency,
+                        sampling_frequency=self.scan.sampling_frequency,
+                        t0_delays=self.scan.t0_delays,
+                        initial_times=self.scan.initial_times,
+                        element_width=self.scan.element_width,
+                        attenuation_coef=self.scan.attenuation_coef,
+                        tx_apodizations=self.scan.tx_apodizations,
+                )
+                
+                # RF is linear in amplitudes, so sum contributions
+                return rf_acc + rf_chunk
+            
+            # Loop over scatterer chunks and accumulate
+            n_chunks = n_scat_padded // chunk_size
+            rf_accum = fori_loop(0, n_chunks, process_scat_chunk, rf_accum)[None]
+            
+            # Write accumulated RF to output
+            rf_data_all = ops.slice_update(rf_data_all, (frame_idx, 0, 0, 0, 0), rf_accum)
+            return rf_data_all
+        
+        # Pre-allocate output: (n_frames, n_tx_sel, n_el_sel, n_freq_sel, 1)
+        output_shape = (n_frames, self.n_tx_samples, self.n_freq_samples, self.n_el_samples, 1)
+        rf_data_all = ops.zeros(output_shape, dtype='complex64')
 
-        #If neccessry implement for-loop with chunks        
-        rf = simulate_rf(
-                scatterer_positions=    self.positions, 
-                scatterer_magnitudes =  magnitudes,
-                el_indices=             el_indices,
-                freq_indices=           freq_indices,
-                tx_indices=             tx_indices,
-                probe_geometry =        self.scan.probe_geometry,
-                apply_lens_correction = self.scan.apply_lens_correction,
-                sound_speed =           self.scan.sound_speed,
-                lens_sound_speed =      self.scan.lens_sound_speed,
-                lens_thickness =        self.scan.lens_thickness,
-                n_ax =                  self.scan.n_ax,
-                center_frequency =      self.scan.center_frequency,
-                sampling_frequency=     self.scan.sampling_frequency,
-                t0_delays =             self.scan.t0_delays,
-                initial_times=          self.scan.initial_times,
-                element_width=          self.scan.element_width,
-                attenuation_coef=       self.scan.attenuation_coef,
-                tx_apodizations=        self.scan.tx_apodizations,)
-        return rf, el_indices, freq_indices, tx_indices
+        # Process all frames with fori_loop
+        rf_data = fori_loop(0, n_frames, process_frame, rf_data_all)
+        
+        return rf_data,  tx_indices, freq_indices, el_indices
+    
+    def transpose(self):
+        raise NotImplementedError("Transpose for SimulateOperatorJaxus is not implemented.")
+
+    def __str__(self):
+        return f"SimulateOperator implemented in jax"
+

@@ -711,7 +711,7 @@ class DiffusionModel(DeepGenerativeModel):
 
             # this new noisy image will be used in the next step
             if verbose:
-                progbar.update(step + 1, [("error", error)])
+                progbar.update(step + 1, [("error", omega*error)])
 
             self.store_progress(step, track_progress_type, next_noisy_images, pred_images)
 
@@ -882,8 +882,8 @@ class DiffusionGuidance(abc.ABC, Object):
         raise NotImplementedError
 
 
-@diffusion_guidance_registry(name="dps_rf")
-class DPS_RF(DiffusionGuidance):
+@diffusion_guidance_registry(name="dps_sim")
+class DPS_SIM(DiffusionGuidance):
     """Diffusion Posterior Sampling guidance."""
 
     def setup(self):
@@ -928,17 +928,23 @@ class DPS_RF(DiffusionGuidance):
         # Note that while the DPS paper specifies a squared L2 here, we follow their
         # implementation, which uses a standard L2:
         # https://github.com/DPS2022/diffusion-posterior-sampling/blob/effbde7325b22ce8dc3e2c06c160c021e743a12d/guided_diffusion/condition_methods.py#L31  # noqa: E501
-        rf_data, el_indices, freq_indices, tx_indices = self.operator.forward(pred_images, seed, **kwargs)
+        rf_data, tx_indices, freq_indices, el_indices= self.operator.forward(pred_images, seed, **kwargs)
 
         grid_idx = jnp.ix_(
         jnp.arange(measurements.shape[0]), # Batch dim
-        tx_indices,                        # Transmit/Frame dim
-        freq_indices,                      # Frequency indices
+        tx_indices,                        # Transmit/Frame dimd
+        freq_indices,                      # Frequency indices or axial indices
         el_indices,                        # Element indices
         jnp.arange(measurements.shape[4])  # Last dim (e.g. Channel)
         )       
 
-        measurement_error = L2(measurements[grid_idx] - rf_data)
+        # Split complex difference into real and imaginary parts for autograd
+        diff = measurements[grid_idx] - rf_data
+        diff_real = ops.real(diff)
+        diff_imag = ops.imag(diff)
+        
+        # Compute L2 norm on real-valued tensors
+        measurement_error = ops.sqrt(ops.sum(diff_real**2 + diff_imag**2))
 
         return measurement_error, (pred_noises, pred_images)
 
@@ -952,7 +958,6 @@ class DPS_RF(DiffusionGuidance):
             operator: Forward operator.
             noise_rates: Current noise rates.
             signal_rates: Current signal rates.
-            omega: Weight for the measurement error.
             **kwargs: Additional arguments for the operator.
 
         Returns:
