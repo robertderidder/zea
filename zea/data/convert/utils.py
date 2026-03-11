@@ -226,7 +226,8 @@ def download_from_girder(  # pragma: no cover
 
             download_url = f"{GIRDER_API}/item/{item['_id']}/download"
             log.debug(f"Downloading {item['name']}...")
-            urllib.request.urlretrieve(download_url, str(file_path))
+            with urllib.request.urlopen(download_url, timeout=timeout) as resp:
+                file_path.write_bytes(resp.read())
 
     log.info(f"{dataset_name} dataset downloaded to {destination}")
     return destination
