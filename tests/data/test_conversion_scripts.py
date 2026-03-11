@@ -103,9 +103,9 @@ def create_test_data_for_dataset(dataset, src):
     elif dataset == "echonetlvh":
         extra_args = create_echonetlvh_test_data(src)
     elif dataset == "camus":
-        create_camus_test_data(src)
+        extra_args = create_camus_test_data(src)
     elif dataset == "cetus":
-        create_cetus_test_data(src)
+        extra_args = create_cetus_test_data(src)
     elif dataset == "picmus":
         create_picmus_test_data(src)
     elif dataset == "verasonics":
@@ -422,6 +422,8 @@ def create_camus_test_data(src):
         image.SetMetaData("StudyDate", "01011970")
         sitk.WriteImage(image, str(filepath))
 
+    return ["--no_hyperthreading"]  # for code coverage to hit
+
 
 def create_cetus_test_data(src):
     """Create CETUS-like NIfTI test data.
@@ -451,6 +453,8 @@ def create_cetus_test_data(src):
             gt_image = sitk.GetImageFromArray(gt)
             gt_image.SetSpacing((0.0005763, 0.0005763, 0.0005763))
             sitk.WriteImage(gt_image, str(patient_dir / f"{patient_name}_{tp}_gt.nii.gz"))
+
+    return ["--no_hyperthreading"]  # for code coverage to hit
 
 
 def create_picmus_test_data(src):
