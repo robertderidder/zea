@@ -441,7 +441,7 @@ class FirFilter(Operation):
 
         def _convolve(signal):
             """Apply the filter to the signal using correlation."""
-            return correlate(signal, fir_filter_taps[::-1], mode="same")
+            return correlate(signal, ops.flip(fir_filter_taps, axis=0), mode="same")
 
         filtered_signal = apply_along_axis(_convolve, axis, signal)
 
@@ -1017,7 +1017,7 @@ class ApplyWindow(Operation):
 
     def call(self, **kwargs):
         data = kwargs[self.key]
-        dtype = data.dtype
+        dtype = ops.dtype(data)
         axis = canonicalize_axis(self.axis, ops.ndim(data))
 
         length = ops.shape(data)[axis]
