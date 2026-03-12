@@ -27,9 +27,7 @@ def get_ops(ops_name):
 
 def _to_native(value):
     """Convert non-serializable types (e.g. numpy) to native Python equivalents."""
-    if hasattr(value, "item"):  # numpy scalar
-        return value.item()
-    if hasattr(value, "tolist") and hasattr(value, "ndim"):  # numpy array
+    if hasattr(value, "ndim"):
         return value.tolist()
     if isinstance(value, tuple):
         return tuple(_to_native(v) for v in value)
