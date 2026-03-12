@@ -122,8 +122,11 @@ def simulate_rf(
         dist_total = dist[:, None] + dist[:, :, None]
 
         # [n_scat, n_txel, n_rxel]
+        t0_delay_tx = ops.take(t0_delays, tx_idx, axis=0)
+        initial_times_tx = ops.take(initial_times, tx_idx, axis=0)
+
         tau_total = (
-            (dist_total / sound_speed) + t0_delays[tx_idx][None, :, None] - initial_times[tx_idx]
+            (dist_total / sound_speed) + t0_delay_tx[None, :, None] - initial_times_tx
         )
 
         scat_pos_relative_to_probe = scatterer_positions[:, None] - probe_geometry[None]

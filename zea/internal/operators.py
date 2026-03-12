@@ -241,9 +241,7 @@ class SimulatorPartial(Operator):
         zero.
         """
         if self.scan.grid_type == "polar":
-            rho_range = (
-                self.scan.rho_range,
-            )
+            rho_range = self.scan.rho_range
 
             theta_range = (
                 self.scan.polar_angles[0],
@@ -362,13 +360,13 @@ class SimulatorPartialFFT(Operator):
         self.n_freq_samples = n_freq_samples
         self.n_tx_samples = n_tx_samples
         self.wavefront_only = wavefront_only
-        self.positions = self.compute_scatterer_positions()
+        self.positions = jnp.reshape(self.scan.grid, (-1, 3))
         self.scatterer_chunk_size = scatterer_chunk_size
 
     def fit_point_scatterers(image):
         """
         does this make sens? sampling at every iteration seems wasetful. initializing once, and updating along with amplitudes seems better.
-        In that case I would only have to sample from the initial guess which is the tweedy estimate
+        In that case I would only have to sample from the initial guess which is the tweedy estimate, or a prior sample.
         https://github.com/tue-bmd/Bayesian-REFoCUS/blob/echonetlvh/simulation/fit_point_scatterers.py
         """
         return 0
@@ -394,9 +392,8 @@ class SimulatorPartialFFT(Operator):
         zero.
         """
         if self.scan.grid_type == "polar":
-            rho_range = (
-                self.scan.rho_range,
-            )
+            rho_range = self.scan.rho_range
+
 
             theta_range = (
                 self.scan.polar_angles[0],
