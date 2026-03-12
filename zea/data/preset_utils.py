@@ -110,7 +110,11 @@ def _hf_resolve_path(
     - hf://org/repo - Downloads all files in repo
     """
     repo_id, subpath = _hf_parse_path(hf_path)
-    files = _hf_list_files(repo_id, repo_type=repo_type, **kwargs)
+    files = _hf_list_files(
+        repo_id,
+        repo_type=repo_type,
+        **kwargs,
+    )
 
     if subpath:
         # Directory case
