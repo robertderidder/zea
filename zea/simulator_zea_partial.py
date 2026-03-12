@@ -227,7 +227,6 @@ def simulate_rf(
 
     rf_data = ops.stack(parts, axis=0)
     
-    # Add batch and channel dimensions: [n_tx, n_el, n_ax] -> [1, n_tx, n_ax, n_el, 1]
     rf_data = ops.transpose(rf_data, (0, 2, 1))[...,None]
     return rf_data
 
