@@ -119,6 +119,8 @@ class Pipeline:
         if jit_kwargs is None:
             jit_kwargs = {}
 
+        self._user_jit_kwargs = jit_kwargs.copy()
+
         if keras.backend.backend() == "jax" and self.static_params != []:
             jit_kwargs = {"static_argnames": self.static_params}
 
@@ -497,24 +499,42 @@ class Pipeline:
         else:
             raise ValueError("File must have extension .json, .yaml, or .yml")
 
-    def get_dict(self) -> dict:
-        """Convert the pipeline to a dictionary."""
-        config = {}
-        config["name"] = ops_registry.get_name(self)
-        config["operations"] = self._pipeline_to_list(self)
-        config["params"] = {
-            "with_batch_dim": self.with_batch_dim,
-            "jit_options": self.jit_options,
-            "jit_kwargs": self.jit_kwargs,
-        }
+    def get_dict(self, verbose=False) -> dict:
+        """Convert the pipeline to a dictionary.
+
+        Args:
+            verbose (bool): If True, include all parameters for full
+                reproducibility. If False (default), only include
+                parameters that differ from their defaults.
+        """
+        config = {"name": ops_registry.get_name(self)}
+        config["operations"] = self._pipeline_to_list(self, verbose=verbose)
+
+        if verbose:
+            config["params"] = {
+                "with_batch_dim": self.with_batch_dim,
+                "jit_options": self.jit_options,
+                "jit_kwargs": self._user_jit_kwargs,
+            }
+        else:
+            params = {}
+            if not self.with_batch_dim:
+                params["with_batch_dim"] = self.with_batch_dim
+            if self.jit_options != "ops":
+                params["jit_options"] = self.jit_options
+            if self._user_jit_kwargs:
+                params["jit_kwargs"] = self._user_jit_kwargs
+            if params:
+                config["params"] = params
+
         return config
 
     @staticmethod
-    def _pipeline_to_list(pipeline):
+    def _pipeline_to_list(pipeline, verbose=False):
         """Convert the pipeline to a list of operations."""
         ops_list = []
         for op in pipeline.operations:
-            ops_list.append(op.get_dict())
+            ops_list.append(op.get_dict(verbose=verbose))
         return ops_list
 
     @classmethod
@@ -591,17 +611,17 @@ class Pipeline:
         """
         return pipeline_from_json(json_string, **kwargs)
 
-    def to_config(self) -> Config:
+    def to_config(self, verbose=False) -> Config:
         """Convert the pipeline to a `zea.Config` object."""
-        return pipeline_to_config(self)
+        return pipeline_to_config(self, verbose=verbose)
 
-    def to_json(self) -> str:
+    def to_json(self, verbose=False) -> str:
         """Convert the pipeline to a JSON string."""
-        return pipeline_to_json(self)
+        return pipeline_to_json(self, verbose=verbose)
 
-    def to_yaml(self, file_path: str) -> None:
+    def to_yaml(self, file_path: str, verbose=False) -> None:
         """Convert the pipeline to a YAML file."""
-        pipeline_to_yaml(self, file_path)
+        pipeline_to_yaml(self, file_path, verbose=verbose)
 
     @property
     def key(self) -> str:
@@ -908,14 +928,16 @@ class PatchedGrid(Map):
         super().__init__(*args, argnames=["flatgrid", "flat_pfield"], chunks=num_patches, **kwargs)
         self.num_patches = num_patches
 
-    def get_dict(self):
+    def get_dict(self, verbose=False):
         """Get the configuration of the pipeline."""
-        config = super().get_dict()
-        config.update({"name": "patched_grid"})
+        config = super().get_dict(verbose=verbose)
+        config["name"] = "patched_grid"
 
-        config["params"].pop("argnames")
-        config["params"].pop("chunks")
-        config["params"].update({"num_patches": self.num_patches})
+        params = config.get("params", {})
+        params.pop("argnames", None)
+        params.pop("chunks", None)
+        params["num_patches"] = self.num_patches
+        config["params"] = params
         return config
 
 

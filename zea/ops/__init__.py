@@ -121,6 +121,7 @@ from .ultrasound import (
     ApplyWindow,
     BandPassFilter,
     ChannelsToComplex,
+    CommonMidpointPhaseError,
     Companding,
     ComplexToChannels,
     Demodulate,
@@ -135,7 +136,6 @@ from .ultrasound import (
     ScanConvert,
     Simulate,
     TOFCorrection,
-    CommonMidpointPhaseError,
     UpMix,
 )
 

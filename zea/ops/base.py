@@ -93,6 +93,8 @@ class Operation(keras.Operation):
         if jit_kwargs is None:
             jit_kwargs = {}
 
+        self._user_jit_kwargs = jit_kwargs.copy()
+
         if keras.backend.backend() == "jax" and self.static_params:
             jit_kwargs |= {"static_argnames": self.static_params}
 
@@ -260,19 +262,45 @@ class Operation(keras.Operation):
 
         return combined_kwargs
 
-    def get_dict(self):
-        """Get the configuration of the operation. Inherit from keras.Operation."""
-        config = {}
-        config.update({"name": ops_registry.get_name(self)})
-        config["params"] = {
-            "key": self.key,
-            "output_key": self.output_key,
-            "cache_inputs": self.cache_inputs,
-            "cache_outputs": self.cache_outputs,
-            "jit_compile": self._jit_compile,
-            "with_batch_dim": self.with_batch_dim,
-            "jit_kwargs": self.jit_kwargs,
-        }
+    def get_dict(self, verbose=False):
+        """Get the configuration of the operation.
+
+        Args:
+            verbose (bool): If True, include all parameters for full
+                reproducibility. If False (default), only include
+                parameters that differ from their defaults.
+        """
+        config = {"name": ops_registry.get_name(self)}
+
+        if verbose:
+            config["params"] = {
+                "key": self.key,
+                "output_key": self.output_key,
+                "cache_inputs": self.cache_inputs,
+                "cache_outputs": self.cache_outputs,
+                "jit_compile": self._jit_compile,
+                "with_batch_dim": self.with_batch_dim,
+                "jit_kwargs": self._user_jit_kwargs,
+            }
+        else:
+            params = {}
+            if self.key != "data":
+                params["key"] = self.key
+            if self.output_key != self.key:
+                params["output_key"] = self.output_key
+            if self.cache_inputs:
+                params["cache_inputs"] = self.cache_inputs
+            if self.cache_outputs:
+                params["cache_outputs"] = self.cache_outputs
+            if not self._jit_compile:
+                params["jit_compile"] = self._jit_compile
+            if not self.with_batch_dim:
+                params["with_batch_dim"] = self.with_batch_dim
+            if self._user_jit_kwargs:
+                params["jit_kwargs"] = self._user_jit_kwargs
+            if params:
+                config["params"] = params
+
         return config
 
     def __eq__(self, other):

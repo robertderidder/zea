@@ -12,7 +12,11 @@ from zea.beamform.delays import compute_t0_delays_planewave
 from zea.config import Config
 from zea.internal.core import DEFAULT_DYNAMIC_RANGE, DataTypes
 from zea.internal.registry import ops_registry
-from zea.ops.pipeline import pipeline_from_config, pipeline_from_json, pipeline_from_yaml
+from zea.ops.pipeline import (
+    pipeline_from_config,
+    pipeline_from_json,
+    pipeline_from_yaml,
+)
 from zea.probes import Probe
 from zea.scan import Scan
 
