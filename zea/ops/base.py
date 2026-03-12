@@ -27,7 +27,7 @@ def get_ops(ops_name):
 
 def _to_native(value):
     """Convert non-serializable types (e.g. numpy) to native Python equivalents."""
-    if hasattr(value, "ndim"):
+    if hasattr(value, "ndim") and callable(getattr(value, "tolist", None)):
         return value.tolist()
     if isinstance(value, tuple):
         return tuple(_to_native(v) for v in value)
@@ -88,7 +88,9 @@ class Operation(keras.Operation):
         self.output_key = output_key  # Key for output data
         if self.output_key is None:
             self.output_key = self.key
-        self.additional_output_keys = additional_output_keys or []
+        self.additional_output_keys = (
+            list(additional_output_keys) if additional_output_keys is not None else []
+        )
 
         self.inputs = []  # Source(s) of input data (name of a previous operation)
         self.allow_multiple_inputs = False  # Only single input allowed by default
@@ -304,6 +306,11 @@ class Operation(keras.Operation):
                 seen.add(name)
 
                 value = _to_native(getattr(self, name, None))
+                if callable(value):
+                    raise TypeError(
+                        f"Parameter '{name}' of '{type(self).__name__}' is callable and cannot "
+                        "be serialized to config. Override get_dict() to skip it."
+                    )
                 if verbose:
                     params[name] = value
                 elif param.default is inspect.Parameter.empty or value != param.default:

@@ -13,6 +13,9 @@ from zea.config import Config
 from zea.internal.core import DEFAULT_DYNAMIC_RANGE, DataTypes
 from zea.internal.registry import ops_registry
 from zea.ops.pipeline import (
+    Beamform,
+    Map,
+    PatchedGrid,
     Pipeline,
     pipeline_from_config,
     pipeline_from_json,
@@ -1051,3 +1054,168 @@ def test_all_functions_exported():
         exported_names=set(func.__all__),
         file_path="zea/func/__init__.py",
     )
+
+
+def test_pipeline_repr():
+    """Test Pipeline.__repr__ output format."""
+    pipeline = ops.Pipeline([MultiplyOperation(), AddOperation()], name="test_pipe")
+    r = repr(pipeline)
+    assert r == "<Pipeline test_pipe=(MultiplyOperation, AddOperation)>"
+
+    # Nested pipeline repr
+    inner = ops.Pipeline([AddOperation()], name="inner")
+    outer = ops.Pipeline([MultiplyOperation(), inner], name="outer")
+    r2 = repr(outer)
+    assert "Pipeline inner" in r2
+
+
+def test_pipeline_eq():
+    """Test Pipeline.__eq__ for equal and non-equal cases."""
+    p1 = ops.Pipeline([MultiplyOperation(), AddOperation()], jit_options=None)
+    p2 = ops.Pipeline([MultiplyOperation(), AddOperation()], jit_options=None)
+    assert p1 == p2
+
+    p3 = ops.Pipeline([AddOperation()], jit_options=None)
+    assert p1 != p3
+
+    # Non-Pipeline comparison
+    assert p1 != "not a pipeline"
+
+
+def test_pipeline_get_dict_verbose_and_compact():
+    """Test Pipeline.get_dict() in both verbose and compact modes."""
+    pipeline = ops.Pipeline(
+        [MultiplyOperation(), AddOperation()],
+        jit_options=None,
+        name="mypipe",
+    )
+    compact = pipeline.get_dict(verbose=False)
+    assert compact["name"] == "pipeline"
+    assert "operations" in compact
+    # jit_options=None is non-default → should appear in compact
+    assert compact["params"]["jit_options"] is None
+
+    verbose = pipeline.get_dict(verbose=True)
+    assert verbose["params"]["with_batch_dim"] is True
+    assert verbose["params"]["jit_options"] is None
+
+
+def test_pipeline_load_from_yaml(tmp_path):
+    """Test Pipeline.load() with a YAML file delegates to from_path."""
+    config = Config(
+        {
+            "pipeline": {
+                "operations": [
+                    {"name": "multiply"},
+                    {"name": "add"},
+                ]
+            }
+        }
+    )
+    path = str(tmp_path / "pipe.yaml")
+    config.save_to_yaml(path)
+
+    pipeline = Pipeline.load(path, jit_options=None)
+    assert isinstance(pipeline.operations[0], MultiplyOperation)
+    assert isinstance(pipeline.operations[1], AddOperation)
+
+
+def test_pipeline_load_from_json(tmp_path):
+    """Test Pipeline.load() with a JSON file."""
+
+    config_dict = {
+        "pipeline": {
+            "operations": [
+                {"name": "multiply"},
+                {"name": "add"},
+            ]
+        }
+    }
+    path = str(tmp_path / "pipe.json")
+    with open(path, "w") as f:
+        json.dump(config_dict, f)
+
+    pipeline = Pipeline.load(path, jit_options=None)
+    assert isinstance(pipeline.operations[0], MultiplyOperation)
+
+    # Bad extension
+    with pytest.raises(ValueError, match="extension"):
+        Pipeline.load(str(tmp_path / "pipe.txt"))
+
+
+def test_pipeline_call_keyerror():
+    """Test that a missing key inside pipeline.call raises a plain KeyError with a helpful msg."""
+
+    @ops_registry("needs_missing_key")
+    class NeedsMissingKey(ops.Operation):
+        def call(self, **kwargs):
+            return {"result": kwargs["nonexistent_key"]}
+
+    pipeline = ops.Pipeline([NeedsMissingKey()], jit_options=None, validate=False)
+    with pytest.raises(KeyError, match="nonexistent_key"):
+        pipeline(data=None)
+
+
+def test_pipeline_call_runtime_error():
+    """Test that a generic exception in pipeline.call is wrapped in RuntimeError."""
+
+    @ops_registry("always_crashes")
+    class AlwaysCrashes(ops.Operation):
+        def call(self, **kwargs):
+            raise ValueError("boom")
+
+    pipeline = ops.Pipeline([AlwaysCrashes()], jit_options=None, validate=False)
+    with pytest.raises(RuntimeError, match="boom"):
+        pipeline(data=None)
+
+
+def test_map_get_dict():
+    """Test Map.get_dict() serialises argnames and non-default params."""
+
+    m = Map(
+        operations=[AddOperation()],
+        argnames="x",
+        in_axes=1,
+        chunks=4,
+        jit_options=None,
+    )
+    d = m.get_dict(verbose=False)
+    assert d["name"] == "map"
+    assert d["params"]["argnames"] == ["x"]
+    assert d["params"]["in_axes"] == 1
+    assert d["params"]["chunks"] == 4
+
+    d_v = m.get_dict(verbose=True)
+    assert d_v["params"]["out_axes"] == 0
+    assert d_v["params"]["batch_size"] is None
+
+
+def test_patched_grid_get_dict():
+    """Test PatchedGrid.get_dict() uses num_patches and hides argnames/chunks."""
+
+    pg = PatchedGrid(
+        operations=[AddOperation()],
+        num_patches=20,
+        jit_options=None,
+    )
+    d = pg.get_dict(verbose=False)
+    assert d["name"] == "patched_grid"
+    assert d["params"]["num_patches"] == 20
+    assert "argnames" not in d["params"]
+    assert "chunks" not in d["params"]
+
+
+def test_beamform_repr():
+    """Test Beamform.__repr__ returns the expected format."""
+
+    b = Beamform(num_patches=1, jit_options=None)
+    r = repr(b)
+    assert r.startswith("<Beamform")
+    assert "TOFCorrection" in r
+
+
+def test_get_dict_callable_param_raises():
+    """Test that get_dict raises TypeError when a param is callable (e.g. Lambda.func)."""
+    lam = ops.Lambda(lambda x: {"data": x + 1})
+    with pytest.raises(TypeError, match="callable"):
+        lam.get_dict()

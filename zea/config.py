@@ -21,9 +21,9 @@ Example Usage
     >>> from zea import Config
 
     >>> # Load from YAML
-    >>> config = Config.from_yaml("../configs/config_echonet.yaml")
+    >>> config = Config.from_path("../configs/config_echonet.yaml")
     >>> # Load from HuggingFace Hub
-    >>> config = Config.from_hf("zeahub/configs", "config_picmus_rf.yaml", repo_type="dataset")
+    >>> config = Config.from_path("hf://zeahub/configs/config_picmus_rf.yaml")
 
     >>> # Access attributes with dot notation
     >>> print(config.data.dtype)
@@ -51,12 +51,12 @@ from pathlib import Path
 from typing import Union
 
 import yaml
-from huggingface_hub import hf_hub_download
 
 from zea import log
 from zea.data.preset_utils import HF_PREFIX, _hf_resolve_path
 from zea.internal.config.validation import config_schema
 from zea.internal.core import dict_to_tensor
+from zea.internal.utils import deprecated
 
 
 class Config(dict):
@@ -65,8 +65,7 @@ class Config(dict):
     This Config class extends a normal dictionary with dot notation access.
 
     Features:
-        - `Config.from_yaml` method to load a config from a yaml file.
-        - `Config.from_hf` method to load a config from a huggingface hub.
+        - `from_path` method to load a config from a yaml file (local or huggingface hub).
         - `save_to_yaml` method to save the config to a yaml file.
         - `copy` method to create a deep copy of the config.
         - Normal dictionary methods such as `keys`, `values`, `items`, `pop`, `update`, `get`.
@@ -438,7 +437,7 @@ class Config(dict):
                         v._recursive_setattr(set_key, set_value)
 
     @classmethod
-    def from_path(cls, path, **kwargs):
+    def from_path(cls, path, loader=yaml.FullLoader, **kwargs):
         """Load config object from a file path.
 
         Args:
@@ -446,17 +445,21 @@ class Config(dict):
                 Can be a string or a Path object. Additionally can be a string with
                 the prefix 'hf://', in which case it will be resolved to a
                 huggingface path.
+            loader (yaml.Loader, optional): YAML loader used after the file is resolved.
+            **kwargs: Additional Hugging Face Hub arguments for ``hf://`` paths,
+                for example ``repo_type`` or ``revision``.
 
         Returns:
             Config: config object.
         """
         if str(path).startswith(HF_PREFIX):
-            path = _hf_resolve_path(str(path))
+            path = _hf_resolve_path(str(path), **kwargs)
         if isinstance(path, str):
             path = Path(path)
-        return _load_config_from_yaml(path, config_class=cls, **kwargs)
+        return _load_config_from_yaml(path, config_class=cls, loader=loader)
 
     @classmethod
+    @deprecated(replacement="Config.from_path")
     def from_hf(cls, repo_id, path, **kwargs):
         """Load config object from huggingface hub.
 
@@ -481,10 +484,10 @@ class Config(dict):
                 ...     "zeahub/configs", "config_camus.yaml", repo_type="dataset"
                 ... )
         """
-        local_path = hf_hub_download(repo_id, path, **kwargs)
-        return _load_config_from_yaml(local_path, config_class=cls)
+        return cls.from_path(f"{HF_PREFIX}{repo_id}/{path}", **kwargs)
 
     @classmethod
+    @deprecated(replacement="Config.from_path")
     def from_yaml(cls, path, **kwargs):
         """Load config object from yaml file."""
         return cls.from_path(path, **kwargs)

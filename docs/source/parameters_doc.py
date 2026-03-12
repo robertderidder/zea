@@ -242,9 +242,9 @@ Here is a minimal example of how to load and save a config file using zea:
     >>> from zea.config import check_config
 
     >>> # Load a config from file
-    >>> config = Config.from_yaml("../configs/config_picmus_rf.yaml")
+    >>> config = Config.from_path("../configs/config_picmus_rf.yaml")
     >>> # or some predefined from Hugging Face Hub
-    >>> config = Config.from_hf("zeahub/configs", "config_picmus_rf.yaml", repo_type="dataset")
+    >>> config = Config.from_path("hf://zeahub/configs/config_picmus_rf.yaml")
 
     >>> # We can check if the config has valid parameters (zea compliance)
     >>> config = check_config(config)

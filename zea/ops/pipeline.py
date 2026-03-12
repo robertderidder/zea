@@ -1304,7 +1304,7 @@ def pipeline_from_json(json_string: str, **kwargs) -> Pipeline:
 
 
 @deprecated(replacement="Pipeline.from_path")
-def pipeline_from_yaml(yaml_path: str, **kwargs) -> Pipeline:
+def pipeline_from_yaml(yaml_path: str, **kwargs) -> Pipeline:  # pragma: no cover
     """
     Create a Pipeline instance from a YAML file.
 
