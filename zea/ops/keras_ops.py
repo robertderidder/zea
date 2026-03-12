@@ -10,7 +10,7 @@ They can be used in zea pipelines like any other :class:`zea.Operation`, for exa
     >>> op = Squeeze(axis=1)
 
 This file is generated automatically. Do not edit manually.
-Generated with Keras 3.12.0
+Generated with Keras 3.13.1
 """
 
 import keras
@@ -207,6 +207,16 @@ class Array(Lambda):
             super().__init__(func=keras.ops.array, **kwargs)
         except AttributeError as e:
             raise MissingKerasOps("Array", "keras.ops.array") from e
+
+@ops_registry("keras.ops.array_split")
+class ArraySplit(Lambda):
+    """Operation wrapping keras.ops.array_split."""
+
+    def __init__(self, **kwargs):
+        try:
+            super().__init__(func=keras.ops.array_split, **kwargs)
+        except AttributeError as e:
+            raise MissingKerasOps("ArraySplit", "keras.ops.array_split") from e
 
 @ops_registry("keras.ops.average")
 class Average(Lambda):
@@ -617,6 +627,16 @@ class Elu(Lambda):
             super().__init__(func=keras.ops.elu, **kwargs)
         except AttributeError as e:
             raise MissingKerasOps("Elu", "keras.ops.elu") from e
+
+@ops_registry("keras.ops.empty_like")
+class EmptyLike(Lambda):
+    """Operation wrapping keras.ops.empty_like."""
+
+    def __init__(self, **kwargs):
+        try:
+            super().__init__(func=keras.ops.empty_like, **kwargs)
+        except AttributeError as e:
+            raise MissingKerasOps("EmptyLike", "keras.ops.empty_like") from e
 
 @ops_registry("keras.ops.erf")
 class Erf(Lambda):
@@ -1887,6 +1907,16 @@ class Unstack(Lambda):
             super().__init__(func=keras.ops.unstack, **kwargs)
         except AttributeError as e:
             raise MissingKerasOps("Unstack", "keras.ops.unstack") from e
+
+@ops_registry("keras.ops.vander")
+class Vander(Lambda):
+    """Operation wrapping keras.ops.vander."""
+
+    def __init__(self, **kwargs):
+        try:
+            super().__init__(func=keras.ops.vander, **kwargs)
+        except AttributeError as e:
+            raise MissingKerasOps("Vander", "keras.ops.vander") from e
 
 @ops_registry("keras.ops.var")
 class Var(Lambda):
