@@ -544,7 +544,24 @@ class Pipeline:
             if isinstance(op, Pipeline):
                 ops_list.append(op.get_dict(compact=compact))
             else:
-                ops_list.append(op.get_dict(compact=compact))
+                d = op.get_dict(compact=compact)
+                if compact:
+                    params = d.get("params", {})
+                    # Strip with_batch_dim when it is merely inherited from the pipeline
+                    if params.get("with_batch_dim") == pipeline.with_batch_dim:
+                        params.pop("with_batch_dim", None)
+                    # Strip jit_compile=False when it is implied by pipeline-level JIT
+                    if not params.get("jit_compile", True) and pipeline.jit_options in (
+                        None,
+                        "pipeline",
+                    ):
+                        params.pop("jit_compile", None)
+                    if not params:
+                        d.pop("params", None)
+                    # Name-only dict → bare string shorthand
+                    if list(d.keys()) == ["name"]:
+                        d = d["name"]
+                ops_list.append(d)
         return ops_list
 
     @classmethod

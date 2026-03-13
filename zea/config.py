@@ -406,11 +406,12 @@ class Config(dict):
     def to_yaml(self, path):
         """Save config contents to a YAML file."""
         with open(Path(path), "w", encoding="utf-8") as save_file:
-            yaml.dump(
+            yaml.safe_dump(
                 self.serialize(),
                 save_file,
                 default_flow_style=False,
                 sort_keys=False,
+                indent=4,
             )
 
     @deprecated(replacement="Config.to_yaml")

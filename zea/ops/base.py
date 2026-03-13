@@ -311,6 +311,16 @@ class Operation(keras.Operation):
 
                 value = _to_native(getattr(self, name, None))
                 if callable(value):
+                    if name == "func":
+                        op_name = ops_registry.get_name(self)
+                        if op_name == "lambda":
+                            raise TypeError(
+                                "Cannot serialize generic 'lambda' operation with an arbitrary "
+                                "callable. Use a registered operation class instead (e.g. "
+                                "zea.ops.keras_ops wrappers) or create a custom Operation "
+                                "subclass."
+                            )
+                        continue
                     raise TypeError(
                         f"Parameter '{name}' of '{type(self).__name__}' is callable and cannot "
                         "be serialized to config. Override get_dict() to skip it."
@@ -453,6 +463,36 @@ class Lambda(Operation):
         else:
             data = self.func(data)
         return {self.output_key: data}
+
+    def get_dict(self, compact=True):
+        """Serialize lambda-based operations.
+
+        Generic ``zea.ops.Lambda`` instances are intentionally rejected because
+        arbitrary callables cannot be reliably serialized. Registered subclasses
+        (e.g. ``zea.ops.keras_ops`` wrappers) are serialized by operation name and
+        the callable keyword arguments.
+        """
+        config = super().get_dict(compact=compact)
+
+        func = self.func.func if isinstance(self.func, partial) else self.func
+        func_sig = inspect.signature(func)
+        func_kwargs = self.func.keywords or {}
+
+        serialized_func_params = {}
+        for name, param in func_sig.parameters.items():
+            if param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD):
+                continue
+            if name in func_kwargs:
+                serialized_func_params[name] = _to_native(func_kwargs[name])
+            elif not compact and param.default is not inspect.Parameter.empty:
+                serialized_func_params[name] = _to_native(param.default)
+
+        if serialized_func_params:
+            existing_params = config.get("params", {})
+            existing_params.update(serialized_func_params)
+            config["params"] = existing_params
+
+        return config
 
 
 @ops_registry("mean")

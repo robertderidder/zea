@@ -12,6 +12,7 @@ from zea.beamform.delays import compute_t0_delays_planewave
 from zea.config import Config
 from zea.internal.core import DEFAULT_DYNAMIC_RANGE, DataTypes
 from zea.internal.registry import ops_registry
+from zea.ops.keras_ops import Squeeze
 from zea.ops.pipeline import (
     Beamform,
     Map,
@@ -1215,10 +1216,42 @@ def test_beamform_repr():
 
 
 def test_get_dict_callable_param_raises():
-    """Test that get_dict raises TypeError when a param is callable (e.g. Lambda.func)."""
+    """Generic Lambda with arbitrary callable should fail with a clear message."""
     lam = ops.Lambda(lambda x: {"data": x + 1})
-    with pytest.raises(TypeError, match="callable"):
+    with pytest.raises(TypeError, match="generic 'lambda' operation"):
         lam.get_dict()
+
+
+def test_wrapped_keras_op_get_dict_serializes_func_kwargs():
+    """Keras-wrapped Lambda ops should serialize op kwargs and skip callable internals."""
+    squeeze = Squeeze(axis=0)
+
+    d = squeeze.get_dict()
+    assert d["name"] == "keras.ops.squeeze"
+    assert d["params"]["axis"] == 0
+    assert "with_batch_dim" not in d["params"]
+
+    d_full = squeeze.get_dict(compact=False)
+    assert d_full["params"]["axis"] == 0
+
+
+def test_pipeline_with_wrapped_keras_op_roundtrip():
+    """Pipelines with wrapped keras ops should serialize and round-trip via config."""
+    pipeline = Pipeline(
+        operations=[Squeeze(axis=0)],
+        jit_options=None,
+    )
+
+    config = pipeline.to_config()
+    op_cfg = config["pipeline"]["operations"][0]
+    assert op_cfg["name"] == "keras.ops.squeeze"
+    assert op_cfg["params"]["axis"] == 0
+
+    rebuilt = Pipeline.from_config(config, jit_options=None)
+    out = rebuilt(data=np.arange(6).reshape(2, 1, 3))
+    assert out["data"].shape == (2, 3)
+
+    assert pipeline == rebuilt, "Pipeline should be equal after round-trip"
 
 
 def test_add_output_keys_class_level_behavior():
