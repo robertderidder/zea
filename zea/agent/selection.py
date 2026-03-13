@@ -137,9 +137,7 @@ class GreedyEntropy(LinesActionModel):
         )
         self.upside_down_gaussian = upside_down_gaussian(points_to_evaluate)
         self.entropy_sigma = entropy_sigma
-        self.select_line_and_reweight_entropy_vmap = tensor.vmap(
-            self.select_line_and_reweight_entropy
-        )
+        self.reweight_entropies_around_line_vmap = tensor.vmap(self.reweight_entropies_around_line)
 
     @staticmethod
     def compute_pairwise_pixel_gaussian_error(
@@ -221,7 +219,7 @@ class GreedyEntropy(LinesActionModel):
         pixelwise_entropy = -ops.sum((1 / n_particles) * log_pixelwise_entropy_sum_j, axis=1)
         return pixelwise_entropy
 
-    def select_line_and_reweight_entropy(self, entropy_per_line, max_entropy_line):
+    def reweight_entropies_around_line(self, entropy_per_line, line_index):
         """Select the line with maximum entropy and reweight the entropies.
 
         Selected the max entropy line and reweights the entropy values around it,
@@ -233,16 +231,16 @@ class GreedyEntropy(LinesActionModel):
             See `Issue #268 <https://github.com/tue-bmd/zea/issues/268>`_
 
         Args:
-            entropy_per_line (Tensor): Entropy per line of shape
-                (batch_size, n_possible_actions)
+            entropy_per_line (Tensor): Entropy per line of shape (n_possible_actions,)
+            line_index (int): Index of the line with maximum entropy
 
         Returns:
             Tuple: The selected line index and the updated entropies per line
         """
 
-        ## The rest of this function updates the entropy values around max_entropy_line
+        ## The rest of this function updates the entropy values around line_index
         ## by multiplying them with an upside-down Gaussian function centered at
-        ## max_entropy_line, setting the entropy of the selected line to 0, and decreasing
+        ## line_index, setting the entropy of the selected line to 0, and decreasing
         ## the entropies of neighbouring lines.
 
         # Pad the entropy per line to allow for re-weighting with fixed
@@ -251,15 +249,14 @@ class GreedyEntropy(LinesActionModel):
             entropy_per_line,
             (self.num_lines_to_update // 2, self.num_lines_to_update // 2),
         )
-        # because the entropy per line has now been padded, the start index
-        # of the set of lines to update is simply the index of the max_entropy_line
-        start_index = max_entropy_line
 
         # Create the re-weighting vector
+        # because the entropy per line has now been padded, the start index
+        # of the set of lines to update is simply the line_index
         reweighting = ops.ones_like(padded_entropy_per_line)
         reweighting = ops.slice_update(
             reweighting,
-            (start_index,),
+            (line_index,),
             ops.cast(self.upside_down_gaussian, dtype=reweighting.dtype),
         )
 
@@ -293,14 +290,15 @@ class GreedyEntropy(LinesActionModel):
         all_selected_lines = []
         for _ in range(self.n_actions):
             max_entropy_line = ops.argmax(linewise_entropy, axis=1)
-            linewise_entropy = self.select_line_and_reweight_entropy_vmap(
+            linewise_entropy = self.reweight_entropies_around_line_vmap(
                 linewise_entropy, max_entropy_line
             )
             all_selected_lines.append(max_entropy_line)
 
-        selected_lines_k_hot = ops.any(
-            ops.one_hot(all_selected_lines, self.n_possible_actions, dtype=masks._DEFAULT_DTYPE),
-            axis=0,
+        selected_lines_k_hot = masks.indices_to_k_hot(
+            ops.stack(all_selected_lines, axis=1),
+            self.n_possible_actions,
+            dtype=masks._DEFAULT_DTYPE,
         )
         return selected_lines_k_hot, self.lines_to_im_size(selected_lines_k_hot)
 
@@ -665,9 +663,8 @@ class TaskBasedLines(GreedyEntropy):
             )
             all_selected_lines.append(max_contribution_line)
 
-        selected_lines_k_hot = ops.any(
-            ops.one_hot(all_selected_lines, self.n_possible_actions, dtype=masks._DEFAULT_DTYPE),
-            axis=0,
+        selected_lines_k_hot = masks.indices_to_k_hot(
+            ops.stack(all_selected_lines, axis=1), self.n_possible_actions
         )
         return (
             selected_lines_k_hot,

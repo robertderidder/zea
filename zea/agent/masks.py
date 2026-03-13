@@ -18,7 +18,7 @@ _DEFAULT_DTYPE = "bool"
 
 
 def indices_to_k_hot(
-    indices: List[int],
+    indices,
     n_possible_actions: int,
     dtype=_DEFAULT_DTYPE,
 ):
@@ -28,16 +28,17 @@ def indices_to_k_hot(
     This is the default represenation for actions in zea.
 
     Args:
-        indices (List[int]): List of indices to set to 1.
+        indices (Tensor): Indices of selected actions to set to 1 of shape (..., n_actions).
         n_possible_actions (int): Total number of possible actions.
-        dtype (str, optional): Data type of the mask. Defaults to _DEFAULT_DTYPE.
+        dtype (str, optional): Data type of the mask. Defaults to `bool`.
 
     Returns:
-        Tensor: k-hot-encoded vector of shape (n_possible_actions).
+        Tensor: k-hot-encoded vector of shape (..., n_possible_actions).
     """
-    mask = ops.zeros(n_possible_actions, dtype=dtype)
-    return ops.scatter_update(
-        mask, ops.expand_dims(indices, axis=1), ops.ones(len(indices), dtype=dtype)
+    indices = ops.moveaxis(indices, -1, 0)  # move n_actions to the front for one_hot
+    return ops.any(
+        ops.one_hot(indices, n_possible_actions, dtype=dtype),
+        axis=0,
     )
 
 
