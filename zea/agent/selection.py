@@ -188,13 +188,13 @@ class GreedyEntropy(LinesActionModel):
             particles, entropy_sigma
         )
         # sum out first dimension of (n_particles x n_particles) error matrix
-        # [n_particles, batch, *pixels]
+        # [batch_size, n_particles, *pixels]
         pixelwise_entropy_sum_j = ops.sum(
             (1 / n_particles) * gaussian_error_per_pixel_stacked, axis=1
         )
         log_pixelwise_entropy_sum_j = ops.log(pixelwise_entropy_sum_j)
         # sum out second dimension of (n_particles x n_particles) error matrix
-        # [batch, *pixels]
+        # [batch_size, *pixels]
         pixelwise_entropy = -ops.sum((1 / n_particles) * log_pixelwise_entropy_sum_j, axis=1)
         return pixelwise_entropy
 
