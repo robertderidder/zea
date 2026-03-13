@@ -46,7 +46,6 @@ from keras import ops
 
 from zea.beamform.lens_correction import compute_lens_corrected_travel_times
 
-
 def simulate_rf(
     scatterer_positions,
     scatterer_magnitudes,
