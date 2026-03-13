@@ -283,9 +283,7 @@ class GreedyEntropy(LinesActionModel):
             all_selected_lines.append(max_entropy_line)
 
         selected_lines_k_hot = masks.indices_to_k_hot(
-            ops.stack(all_selected_lines, axis=1),
-            self.n_possible_actions,
-            dtype=masks._DEFAULT_DTYPE,
+            ops.stack(all_selected_lines, axis=1), self.n_possible_actions
         )
         return selected_lines_k_hot, self.lines_to_im_size(selected_lines_k_hot)
 

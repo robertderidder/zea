@@ -36,10 +36,10 @@ def indices_to_k_hot(
         Tensor: k-hot-encoded vector of shape (..., n_possible_actions).
     """
     indices = ops.moveaxis(indices, -1, 0)  # move n_actions to the front for one_hot
-    return ops.any(
-        ops.one_hot(indices, n_possible_actions, dtype=dtype),
-        axis=0,
-    )
+    k_hot_encoded = ops.any(ops.one_hot(indices, n_possible_actions, dtype="bool"), axis=0)
+
+    # Cast to desired dtype, because ops.any will always return bool
+    return ops.cast(k_hot_encoded, dtype=dtype)
 
 
 def k_hot_to_indices(selected_lines, n_actions: int, fill_value=-1):
