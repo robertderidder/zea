@@ -463,7 +463,9 @@ class LowPassFilterIQ(FirFilter):
     Uses :func:`get_low_pass_iq_filter` to compute the filter taps.
     """
 
-    def __init__(self, axis: int = -3, num_taps: int = 127, **kwargs):
+    def __init__(
+        self, axis: int = -3, num_taps: int = 127, filter_key: str = "low_pass_filter", **kwargs
+    ):
         """Initialize the LowPassFilterIQ operation.
 
         Args:
@@ -473,14 +475,18 @@ class LowPassFilterIQ(FirFilter):
             num_taps (int): Number of taps in the FIR filter. Default is 127.
                 Odd will result in a type I filter, even in a type II filter.
         """
-        self._random_suffix = str(uuid.uuid4())
-        kwargs.pop("filter_key", None)
+        if "jittable" in kwargs:
+            raise ValueError("LowPassFilterIQ is not jittable, so jittable must be set to False.")
+        if "complex_channels" in kwargs and not kwargs["complex_channels"]:
+            raise ValueError(
+                "LowPassFilterIQ operates on IQ data, so complex_channels must be True."
+            )
         kwargs.pop("jittable", None)
         kwargs.pop("complex_channels", None)
         super().__init__(
             axis=axis,
             complex_channels=True,
-            filter_key=f"low_pass_{self._random_suffix}",
+            filter_key=filter_key,
             jittable=False,
             **kwargs,
         )
@@ -511,7 +517,9 @@ class BandPassFilter(FirFilter):
     filter taps.
     """
 
-    def __init__(self, axis: int = -3, num_taps: int = 127, **kwargs):
+    def __init__(
+        self, axis: int = -3, num_taps: int = 127, filter_key: str = "band_pass_filter", **kwargs
+    ):
         """Initialize the BandPassFilter operation.
 
         Args:
@@ -520,13 +528,15 @@ class BandPassFilter(FirFilter):
             num_taps (int): Number of taps in the FIR filter. Default is 127.
                 Odd will result in a type I filter, even in a type II filter.
         """
-        self._random_suffix = str(uuid.uuid4())
-        kwargs.pop("filter_key", None)
+        if "complex_channels" in kwargs and kwargs["complex_channels"]:
+            raise ValueError(
+                "BandPassFilter operates on a real signal, so complex_channels must be False."
+            )
         kwargs.pop("complex_channels", None)
         super().__init__(
             axis=axis,
             complex_channels=False,
-            filter_key=f"band_pass_{self._random_suffix}",
+            filter_key=filter_key,
             **kwargs,
         )
         self.num_taps = num_taps
