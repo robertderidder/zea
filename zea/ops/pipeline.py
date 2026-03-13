@@ -279,7 +279,7 @@ class Pipeline:
         self.reinitialize()
 
     @property
-    def operations(self):
+    def operations(self) -> List[Union[Operation, "Pipeline"]]:
         """Alias for self.layers to match the zea naming convention"""
         return self._pipeline_layers
 
@@ -531,7 +531,7 @@ class Pipeline:
         return config
 
     @staticmethod
-    def _pipeline_to_list(pipeline, verbose=False):
+    def _pipeline_to_list(pipeline: "Pipeline", verbose=False):
         """Convert the pipeline to a list of operations."""
         ops_list = []
         for op in pipeline.operations:
