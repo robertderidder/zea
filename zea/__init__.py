@@ -2,13 +2,16 @@
 
 import importlib.util
 import os
-import sys
+from importlib.metadata import PackageNotFoundError, version
 
 from . import log
 
-# dynamically add __version__ attribute (see pyproject.toml)
-# __version__ = __import__("importlib.metadata").metadata.version(__package__)
-__version__ = "0.0.9"
+try:
+    # dynamically add __version__ attribute (see pyproject.toml)
+    __version__ = version("zea")
+except PackageNotFoundError:
+    # Package is not installed (e.g., running from source)
+    __version__ = "dev"
 
 
 def _bootstrap_backend():

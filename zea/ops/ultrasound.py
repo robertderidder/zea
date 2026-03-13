@@ -1,4 +1,5 @@
 import uuid
+from typing import Tuple
 
 import keras
 import numpy as np
@@ -11,6 +12,7 @@ from zea.func.tensor import (
     apply_along_axis,
     correlate,
     extend_n_dims,
+    gaussian_filter,
     reshape_axis,
 )
 from zea.func.ultrasound import (
@@ -28,13 +30,7 @@ from zea.internal.core import (
     DataTypes,
 )
 from zea.internal.registry import ops_registry
-from zea.ops.base import (
-    ImageOperation,
-    Operation,
-)
-from zea.ops.tensor import (
-    GaussianBlur,
-)
+from zea.ops.base import Filter, Operation
 from zea.simulator import simulate_rf
 from zea.utils import canonicalize_axis
 
@@ -145,6 +141,9 @@ class TOFCorrection(Operation):
         apply_lens_correction=None,
         lens_thickness=None,
         lens_sound_speed=None,
+        sos_map=None,
+        sos_grid_x=None,
+        sos_grid_z=None,
         **kwargs,
     ):
         """Perform time-of-flight correction on raw RF data.
@@ -169,6 +168,9 @@ class TOFCorrection(Operation):
             apply_lens_correction (bool): Whether to apply lens correction
             lens_thickness (float): Lens thickness
             lens_sound_speed (float): Sound speed in the lens
+            sos_map (Tensor): Speed-of-sound map of shape ``(Nz, Nx)`` in m/s.
+            sos_grid_x (Tensor): x-coordinates of ``sos_map`` rows.
+            sos_grid_z (Tensor): z-coordinates of ``sos_map`` columns.
 
         Returns:
             dict: Dictionary containing tof_corrected_data
@@ -194,6 +196,9 @@ class TOFCorrection(Operation):
             "apply_lens_correction": apply_lens_correction,
             "lens_thickness": lens_thickness,
             "lens_sound_speed": lens_sound_speed,
+            "sos_map": sos_map,
+            "sos_grid_x": sos_grid_x,
+            "sos_grid_z": sos_grid_z,
         }
 
         if not self.with_batch_dim:
@@ -436,7 +441,7 @@ class FirFilter(Operation):
 
         def _convolve(signal):
             """Apply the filter to the signal using correlation."""
-            return correlate(signal, fir_filter_taps[::-1], mode="same")
+            return correlate(signal, ops.flip(fir_filter_taps, axis=0), mode="same")
 
         filtered_signal = apply_along_axis(_convolve, axis, signal)
 
@@ -569,7 +574,7 @@ class ComplexToChannels(Operation):
 
 
 @ops_registry("lee_filter")
-class LeeFilter(ImageOperation):
+class LeeFilter(Filter):
     """
     The Lee filter is a speckle reduction filter commonly used in synthetic aperture radar (SAR)
     and ultrasound image processing. It smooths the image while preserving edges and details.
@@ -579,40 +584,41 @@ class LeeFilter(ImageOperation):
     IEEE Transactions on Pattern Analysis and Machine Intelligence, (2), 165-168.
     """
 
-    def __init__(self, sigma=3, kernel_size=None, pad_mode="symmetric", **kwargs):
+    def __init__(
+        self,
+        sigma: float,
+        mode: str = "symmetric",
+        cval: float | None = None,
+        truncate: float = 4.0,
+        axes: Tuple[int] = (-3, -2),
+        **kwargs,
+    ):
         """
         Args:
-            sigma (float): Standard deviation for Gaussian kernel. Default is 3.
-            kernel_size (int, optional): Size of the Gaussian kernel. If None,
-                it will be calculated based on sigma.
-            pad_mode (str): Padding mode to be used for Gaussian blur. Default is "symmetric".
+            sigma (float or tuple): Standard deviation for Gaussian kernel. The standard deviations
+                of the Gaussian filter are given for each axis as a sequence, or as a single number,
+                in which case it is equal for all axes.
+            mode (str, optional): Padding mode for the input image. Default is 'symmetric'.
+                See [keras docs](https://www.tensorflow.org/api_docs/python/tf/keras/ops/pad) for
+                all options and [tensorflow docs](https://www.tensorflow.org/api_docs/python/tf/pad)
+                for some examples. Note that the naming differs from scipy.ndimage.gaussian_filter!
+            cval (float, optional): Value to fill past edges of input if mode is 'constant'.
+                Default is None.
+            truncate (float, optional): Truncate the filter at this many standard deviations.
+                Default is 4.0.
+            axes (Tuple[int], optional): If None, input is filtered along all axes. Otherwise, input
+                is filtered along the specified axes. When axes is specified, any tuples used for
+                sigma, order, mode and/or radius must match the length of axes. The ith entry in
+                any of these tuples corresponds to the ith entry in axes. Default is (-3, -2),
+                which corresponds to the height and width dimensions of a
+                (..., height, width, channels) tensor.
         """
         super().__init__(**kwargs)
         self.sigma = sigma
-        self.kernel_size = kernel_size
-        self.pad_mode = pad_mode
-
-        # Create a GaussianBlur instance for computing local statistics
-        self.gaussian_blur = GaussianBlur(
-            sigma=self.sigma,
-            kernel_size=self.kernel_size,
-            pad_mode=self.pad_mode,
-            with_batch_dim=self.with_batch_dim,
-            jittable=self._jittable,
-            key="data",
-        )
-
-    @property
-    def with_batch_dim(self):
-        """Get the with_batch_dim property of the LeeFilter operation."""
-        return self._with_batch_dim
-
-    @with_batch_dim.setter
-    def with_batch_dim(self, value):
-        """Set the with_batch_dim property of the LeeFilter operation."""
-        self._with_batch_dim = value
-        if hasattr(self, "gaussian_blur"):
-            self.gaussian_blur.with_batch_dim = value
+        self.mode = mode
+        self.cval = cval
+        self.truncate = truncate
+        self.axes = axes
 
     def call(self, **kwargs):
         """Apply the Lee filter to the input data.
@@ -621,23 +627,24 @@ class LeeFilter(ImageOperation):
             data (ops.Tensor): Input image data of shape (height, width, channels) with
                 optional batch dimension if ``self.with_batch_dim``.
         """
-        super().call(**kwargs)
         data = kwargs.pop(self.key)
+        axes = self._resolve_filter_axes(data, self.axes)
 
         # Apply Gaussian blur to get local mean
-        img_mean = self.gaussian_blur.call(data=data, **kwargs)[self.gaussian_blur.output_key]
+        img_mean = gaussian_filter(
+            data, self.sigma, mode=self.mode, cval=self.cval, truncate=self.truncate, axes=axes
+        )
 
         # Apply Gaussian blur to squared data to get local squared mean
-        img_sqr_mean = self.gaussian_blur.call(
-            data=data**2,
-            **kwargs,
-        )[self.gaussian_blur.output_key]
+        img_sqr_mean = gaussian_filter(
+            data**2, self.sigma, mode=self.mode, cval=self.cval, truncate=self.truncate, axes=axes
+        )
 
         # Calculate local variance
         img_variance = img_sqr_mean - img_mean**2
 
         # Calculate global variance (per channel)
-        overall_variance = ops.var(data, axis=(-3, -2), keepdims=True)
+        overall_variance = ops.var(data, axis=axes, keepdims=True)
 
         # Calculate adaptive weights
         eps = keras.config.epsilon()
@@ -1010,7 +1017,7 @@ class ApplyWindow(Operation):
 
     def call(self, **kwargs):
         data = kwargs[self.key]
-        dtype = data.dtype
+        dtype = ops.dtype(data)
         axis = canonicalize_axis(self.axis, ops.ndim(data))
 
         length = ops.shape(data)[axis]
@@ -1037,3 +1044,110 @@ class ApplyWindow(Operation):
         mask = ops.reshape(mask, shape)
 
         return {self.output_key: data * mask}
+
+
+@ops_registry("common_midpoint_phase_error")
+class CommonMidpointPhaseError(Operation):
+    """Calculates the Common Midpoint Phase Error (CMPE)
+
+    Computes CMPE between translated transmit and receive apertures with a common midpoint.
+
+    .. important::
+        Only works for multistatic datasets, e.g. synthetic aperture data.
+
+    .. note::
+        This was directly adapted from the Differentiable Beamforming for Ultrasound Autofocusing (DBUA)
+        paper, see `original paper and code <https://waltersimson.com/dbua/>`_.
+
+    """  # noqa: E501
+
+    def _init_(
+        self,
+        reshape_grid=True,
+        **kwargs,
+    ):
+        super()._init_(
+            input_data_type=None,
+            # DataTypes.IMAGE, because we have an image of the phase map
+            output_data_type=DataTypes.IMAGE,
+            **kwargs,
+        )
+        self.reshape_grid = reshape_grid
+
+    def create_subapertures(self, data, halfsa, dx):
+        """Create subapertures from the data.
+
+        Args:
+            data (ops.Tensor): The data to create subapertures from.
+            halfsa (int): Half of the subaperture.
+            dx (float): The spacing between the subapertures.
+
+        Returns:
+            transmit_subap (ops.Tensor): The transmit subapertures.
+            receive_subap (ops.Tensor): The receive subapertures.
+        """
+        n_tx, n_pix, n_rx, n_ch = data.shape
+        receive_subaps = ops.zeros((n_rx, n_tx))
+        for diag in range(-halfsa, halfsa + 1):
+            receive_subaps = receive_subaps + ops.diag(ops.ones((n_rx - abs(diag),)), diag)
+        receive_subaps = receive_subaps[halfsa : receive_subaps.shape[0] - halfsa : dx]
+        transmit_subaps = ops.flip(receive_subaps, axis=0)
+        return transmit_subaps, receive_subaps
+
+    def process_phase_map(self, data, **kwargs):
+        """Create the common midpoint subaperture phase error map.
+
+        Args:
+            data (ops.Tensor): The data to create the phase error map from.
+
+        Returns:
+            phase_error_map (ops.Tensor): The phase error map.
+        """
+
+        transmit_subaps, receive_subaps = self.create_subapertures(data, 8, 1)
+        complex_data = ops.view_as_complex(data)  # [n_tx, n_pix, n_rx, n_ch] -> [n_rtx, n_pix, r_x]
+        complex_data = ops.transpose(complex_data, (2, 0, 1))  # [n_rx, n_tx, n_pix]
+        rx_zero_count = ops.matmul(receive_subaps, ops.cast(complex_data == 0, "int32"))
+
+        # Mask out subapertures with point outside fov in receive
+        rx_valid = rx_zero_count <= 1
+        complex_data_rx = ops.matmul(receive_subaps, complex_data)
+        complex_data_rx = ops.where(rx_valid, complex_data_rx, 0)
+        complex_data_rx = ops.transpose(complex_data_rx, (1, 0, 2))  # [n_tx, n_subap_rx, n_pix]
+        tx_zero_count = ops.matmul(transmit_subaps, ops.cast(complex_data_rx == 0, "int32"))
+
+        # Mask out subapertures with point outside fov in transmit
+        tx_valid = tx_zero_count <= 1
+
+        data = ops.matmul(transmit_subaps, complex_data_rx)
+        data = ops.where(tx_valid, data, 0)
+        data = ops.transpose(data, (1, 0, 2))  # [n_subap_tx, n_subap, n_pix]
+
+        # take diagonals
+        a = data[:-1, :-1]
+        b = data[1:, 1:]
+        valid = (a != 0) & (b != 0)
+
+        # compute phase difference between cmp neighbours
+        # This only works if the array is regularly spaced
+        xy = a * ops.conj(b)
+        xy = ops.where(valid, xy, 0)
+        dphi = ops.angle(xy)
+        dphi = ops.abs(dphi)
+
+        dphi = ops.sum(dphi, (0, 1)) / ops.cast(ops.sum(valid, (0, 1)), dphi.dtype)
+        return dphi
+
+    def call(
+        self,
+        **kwargs,
+    ):
+        data = kwargs[self.key]
+        if not self.with_batch_dim:
+            pemap = self.process_phase_map(data)
+        else:
+            pemap = ops.map(
+                lambda d: self.process_phase_map(d),
+                data,
+            )
+        return {self.output_key: pemap}

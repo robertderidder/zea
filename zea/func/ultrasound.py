@@ -219,12 +219,14 @@ def get_band_pass_filter(num_taps, sampling_frequency, f1, f2, validate=True):
     if validate:
         if f1 <= 0 or f2 >= 1:
             raise ValueError(
-                "Invalid cutoff frequency: frequencies must be greater than 0 and less than fs/2."
+                f"Invalid cutoff frequency: frequencies must be greater than 0 and less than fs/2. "
+                f"Got f1={f1 * nyq} Hz, f2={f2 * nyq} Hz."
             )
 
         if f1 >= f2:
             raise ValueError(
-                "Invalid cutoff frequencies: the frequencies must be strictly increasing."
+                f"Invalid cutoff frequencies: the frequencies must be strictly increasing. "
+                f"Got f1={f1 * nyq} Hz, f2={f2 * nyq} Hz."
             )
 
     # Build up the coefficients.
@@ -316,24 +318,43 @@ def channels_to_complex(data):
 
 
 def hilbert(x, N: int = None, axis=-1):
-    """Manual implementation of the Hilbert transform function. The function
-    returns the analytical signal.
+    """Implementation of the Hilbert transform function that computes the analytical signal.
 
-    Operated in the Fourier domain.
+    Operates in the Fourier domain by applying a filter that zeros out negative frequencies
+    and doubles positive frequencies.
 
-    Note:
-        THIS IS NOT THE MATHEMATICAL THE HILBERT TRANSFORM as you will find it on
-        wikipedia, but computes the analytical signal. The implementation reproduces
-        the behavior of the `scipy.signal.hilbert` function.
+    .. note::
+        This is NOT the mathematical Hilbert transform as defined in the
+        `Wikipedia article <https://en.wikipedia.org/wiki/Hilbert_transform>`_,
+        but instead computes the analytical signal. The implementation reproduces
+        the behavior of the :func:`scipy.signal.hilbert` function.
 
     Args:
-        x (ndarray): input data of any shape.
-        N (int, optional): number of points in the FFT. Defaults to None.
-        axis (int, optional): axis to operate on. Defaults to -1.
-    Returns:
-        x (ndarray): complex iq data of any shape.k
+        x (ndarray): Input data of any shape.
+        N (int, optional): Number of points to use for the FFT. If specified and greater
+            than the length of the data along the specified axis, the data will be
+            zero-padded. If None, uses the length of x along the specified axis.
+            Defaults to None.
+        axis (int, optional): Axis along which to compute the Hilbert transform.
+            Defaults to -1 (last axis).
 
+    Returns:
+        ndarray: Complex analytical signal with the same shape as the input (or padded
+            to length N if specified). The real part is the original signal and the
+            imaginary part is the Hilbert transform of the signal.
+
+    Raises:
+        ValueError: If N is specified and is less than the length of x along the
+            specified axis.
+
+    Example:
+        >>> import numpy as np
+        >>> from zea.func import hilbert
+        >>> x = np.array([1.0, 2.0, 3.0, 4.0])
+        >>> analytical_signal = hilbert(x)
+        >>> envelope = np.abs(analytical_signal)
     """
+
     input_shape = x.shape
     n_dim = len(input_shape)
 
@@ -344,25 +365,27 @@ def hilbert(x, N: int = None, axis=-1):
 
     if N is not None:
         if N < n_ax:
-            raise ValueError("N must be greater or equal to n_ax.")
-        # only pad along the axis, use manual padding
-        pad = N - n_ax
-        zeros = ops.zeros(
-            input_shape[:axis] + (pad,) + input_shape[axis + 1 :],
-        )
+            raise ValueError(f"N must be greater or equal to n_ax, got N={N}, n_ax={n_ax}")
 
-        x = ops.concatenate((x, zeros), axis=axis)
+        pad = np.maximum(N - n_ax, 0)
+
+        pad_list = [[0, 0] for _ in range(n_dim)]
+        pad_list[axis] = [0, pad]
+
+        x = ops.pad(x, pad_list, mode="constant", constant_values=0.0)
     else:
         N = n_ax
 
     # Create filter to zero out negative frequencies
-    h = np.zeros(N)
-    if N % 2 == 0:
-        h[0] = h[N // 2] = 1
-        h[1 : N // 2] = 2
-    else:
-        h[0] = 1
-        h[1 : (N + 1) // 2] = 2
+    # h[0] = 1, h[1:N//2] = 2, h[N//2] = 1 (if even), rest = 0
+    indices = ops.arange(N, dtype="float32")
+    h = ops.zeros(N, dtype="float32")
+
+    h = ops.where(indices == 0, 1.0, h)
+    h = ops.where((indices > 0) & (indices < N / 2.0), 2.0, h)
+    h = ops.where((N % 2 == 0) & (indices == N / 2.0), 1.0, h)
+
+    h = ops.cast(h, "complex64")
 
     idx = list(range(n_dim))
     # make sure axis gets to the end for fft (operates on last axis)
@@ -371,12 +394,8 @@ def hilbert(x, N: int = None, axis=-1):
     x = ops.transpose(x, idx)
 
     if x.ndim > 1:
-        ind = [np.newaxis] * x.ndim
-        ind[-1] = slice(None)
-        h = h[tuple(ind)]
+        h = ops.reshape(h, [1] * (x.ndim - 1) + [-1])
 
-    h = ops.convert_to_tensor(h)
-    h = ops.cast(h, "complex64")
     h = h + 1j * ops.zeros_like(h)
 
     Xf_r, Xf_i = ops.fft((x, ops.zeros_like(x)))
@@ -395,6 +414,7 @@ def hilbert(x, N: int = None, axis=-1):
 
     Xf_i_inv = ops.cast(Xf_i_inv, "complex64")
     Xf_r_inv = ops.cast(Xf_r_inv, "complex64")
+    N = ops.cast(N, "complex64")
 
     x = Xf_r_inv / N
     x = x + 1j * (-Xf_i_inv / N)
@@ -520,12 +540,11 @@ def envelope_detect(data, axis=-3):
         data = channels_to_complex(data)
     else:
         n_ax = ops.shape(data)[axis]
-        n_ax_float = ops.cast(n_ax, "float32")
 
         # Calculate next power of 2: M = 2^ceil(log2(n_ax))
         # see https://github.com/tue-bmd/zea/discussions/147
-        log2_n_ax = ops.log2(n_ax_float)
-        M = ops.cast(2 ** ops.ceil(log2_n_ax), "int32")
+        log2_n_ax = np.log2(n_ax)
+        M = int(2 ** np.ceil(log2_n_ax))
 
         data = hilbert(data, N=M, axis=axis)
         indices = ops.arange(n_ax)
@@ -533,11 +552,7 @@ def envelope_detect(data, axis=-3):
         data = ops.take(data, indices, axis=axis)
         data = ops.squeeze(data, axis=-1)
 
-    # data = ops.abs(data)
-    real = ops.real(data)
-    imag = ops.imag(data)
-    data = ops.sqrt(real**2 + imag**2)
-    data = ops.cast(data, "float32")
+    data = ops.abs(data)
     return data
 
 

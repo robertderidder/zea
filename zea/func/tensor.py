@@ -1325,7 +1325,7 @@ def gaussian_filter1d(array, sigma, axis=-1, order=0, mode="symmetric", truncate
             of a Gaussian. Default is 0.
         mode (str, optional): Padding mode for the input image. Default is 'symmetric'.
             See [keras docs](https://www.tensorflow.org/api_docs/python/tf/keras/ops/pad) for
-            all options and [tensoflow docs](https://www.tensorflow.org/api_docs/python/tf/pad)
+            all options and [tensorflow docs](https://www.tensorflow.org/api_docs/python/tf/pad)
             for some examples. Note that the naming differs from scipy.ndimage.gaussian_filter!
         cval (float, optional): Value to fill past edges of input if mode is 'constant'.
             Default is None.
@@ -1374,7 +1374,7 @@ def gaussian_filter(
             of a Gaussian. Default is 0.
         mode (str, optional): Padding mode for the input image. Default is 'symmetric'.
             See [keras docs](https://www.tensorflow.org/api_docs/python/tf/keras/ops/pad) for
-            all options and [tensoflow docs](https://www.tensorflow.org/api_docs/python/tf/pad)
+            all options and [tensorflow docs](https://www.tensorflow.org/api_docs/python/tf/pad)
             for some examples. Note that the naming differs from scipy.ndimage.gaussian_filter!
         cval (float, optional): Value to fill past edges of input if mode is 'constant'.
             Default is None.

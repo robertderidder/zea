@@ -929,8 +929,11 @@ class VerasonicsFile(h5py.File):
         # Define the time axis for the gain curve
         t_gain_curve = np.arange(gain_curve.size) * gain_curve_sampling_period
 
+        # For baseband mode two consecutive samples are combined into a single complex sample
+        n_ax = self.n_ax if not self.is_baseband_mode else self.n_ax // 2
+
         # Define the time axis for the axial samples
-        t_samples = np.arange(self.n_ax) / self.sampling_frequency
+        t_samples = np.arange(n_ax) / self.sampling_frequency
 
         # Interpolate the gain_curve to the number of axial samples
         gain_curve = np.interp(t_samples, t_gain_curve, gain_curve)

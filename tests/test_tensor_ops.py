@@ -433,6 +433,8 @@ def test_apply_along_axis(array, axis, fn):
     expected = np.apply_along_axis(np_fn, axis, array)
     np.testing.assert_allclose(result, expected, rtol=1e-5, atol=1e-5)
 
+    return result
+
 
 @pytest.mark.parametrize("mode", ["valid", "same", "full"])
 @backend_equality_check()
@@ -740,6 +742,8 @@ def test_translate(range_from, range_to):
     result = zea.func.translate(arr, range_from, range_to)
     assert right_min <= np.min(result), "Minimum value is too small"
     assert np.max(result) <= right_max, "Maximum value is too large"
+
+    return result
 
 
 @pytest.mark.parametrize(
