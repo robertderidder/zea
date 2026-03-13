@@ -43,6 +43,8 @@ class Operation(keras.Operation):
     A base abstract class for operations in the pipeline with caching functionality.
     """
 
+    ADD_OUTPUT_KEYS: List[str] = []
+
     def __init__(
         self,
         input_data_type: Union[DataTypes, None] = None,
@@ -88,6 +90,8 @@ class Operation(keras.Operation):
         self.output_key = output_key  # Key for output data
         if self.output_key is None:
             self.output_key = self.key
+        if additional_output_keys is None:
+            additional_output_keys = getattr(self.__class__, "ADD_OUTPUT_KEYS", [])
         self.additional_output_keys = (
             list(additional_output_keys) if additional_output_keys is not None else []
         )
@@ -277,13 +281,13 @@ class Operation(keras.Operation):
 
         return combined_kwargs
 
-    def get_dict(self, verbose=False):
+    def get_dict(self, compact=True):
         """Get the configuration of the operation.
 
         Args:
-            verbose (bool): If True, include all parameters for full
-                reproducibility. If False (default), only include
+            compact (bool): If True (default), only include
                 parameters that differ from their defaults.
+                If False, include all parameters for full reproducibility.
         """
         config = {"name": ops_registry.get_name(self)}
         params = {}
@@ -311,21 +315,14 @@ class Operation(keras.Operation):
                         f"Parameter '{name}' of '{type(self).__name__}' is callable and cannot "
                         "be serialized to config. Override get_dict() to skip it."
                     )
-                if verbose:
-                    params[name] = value
-                elif param.default is inspect.Parameter.empty or value != param.default:
+                if compact:
+                    if param.default is inspect.Parameter.empty or value != param.default:
+                        params[name] = value
+                else:
                     params[name] = value
 
         # Base Operation parameters
-        if verbose:
-            params["key"] = self.key
-            params["output_key"] = self.output_key
-            params["cache_inputs"] = self.cache_inputs
-            params["cache_outputs"] = self.cache_outputs
-            params["jit_compile"] = self._jit_compile
-            params["with_batch_dim"] = self.with_batch_dim
-            params["jit_kwargs"] = self._user_jit_kwargs
-        else:
+        if compact:
             if self.key != "data":
                 params["key"] = self.key
             if self.output_key != self.key:
@@ -340,6 +337,14 @@ class Operation(keras.Operation):
                 params["with_batch_dim"] = self.with_batch_dim
             if self._user_jit_kwargs:
                 params["jit_kwargs"] = self._user_jit_kwargs
+        else:
+            params["key"] = self.key
+            params["output_key"] = self.output_key
+            params["cache_inputs"] = self.cache_inputs
+            params["cache_outputs"] = self.cache_outputs
+            params["jit_compile"] = self._jit_compile
+            params["with_batch_dim"] = self.with_batch_dim
+            params["jit_kwargs"] = self._user_jit_kwargs
 
         if params:
             config["params"] = params

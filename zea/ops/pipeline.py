@@ -123,7 +123,13 @@ class Pipeline:
         self._user_jit_kwargs = jit_kwargs.copy()
 
         if keras.backend.backend() == "jax" and self.static_params != []:
-            jit_kwargs = {"static_argnames": self.static_params}
+            existing = jit_kwargs.get("static_argnames", [])
+            if isinstance(existing, str):
+                existing = [existing]
+            jit_kwargs = {
+                **jit_kwargs,
+                "static_argnames": list(set(existing) | set(self.static_params)),
+            }
 
         self.jit_kwargs = jit_kwargs
         self.jit_options = jit_options  # will handle the jit compilation
@@ -500,24 +506,18 @@ class Pipeline:
         else:
             raise ValueError("File must have extension .json, .yaml, or .yml")
 
-    def get_dict(self, verbose=False) -> dict:
+    def get_dict(self, compact=True) -> dict:
         """Convert the pipeline to a dictionary.
 
         Args:
-            verbose (bool): If True, include all parameters for full
-                reproducibility. If False (default), only include
+            compact (bool): If True (default), only include
                 parameters that differ from their defaults.
+                If False, include all parameters for full reproducibility.
         """
         config = {"name": ops_registry.get_name(self)}
-        config["operations"] = self._pipeline_to_list(self, verbose=verbose)
+        config["operations"] = self._pipeline_to_list(self, compact=compact)
 
-        if verbose:
-            config["params"] = {
-                "with_batch_dim": self.with_batch_dim,
-                "jit_options": self.jit_options,
-                "jit_kwargs": self._user_jit_kwargs,
-            }
-        else:
+        if compact:
             params = {}
             if not self.with_batch_dim:
                 params["with_batch_dim"] = self.with_batch_dim
@@ -527,15 +527,24 @@ class Pipeline:
                 params["jit_kwargs"] = self._user_jit_kwargs
             if params:
                 config["params"] = params
+        else:
+            config["params"] = {
+                "with_batch_dim": self.with_batch_dim,
+                "jit_options": self.jit_options,
+                "jit_kwargs": self._user_jit_kwargs,
+            }
 
         return config
 
     @staticmethod
-    def _pipeline_to_list(pipeline, verbose=False):
+    def _pipeline_to_list(pipeline, compact=True):
         """Convert the pipeline to a list of operations."""
         ops_list = []
         for op in pipeline.operations:
-            ops_list.append(op.get_dict(verbose=verbose))
+            if isinstance(op, Pipeline):
+                ops_list.append(op.get_dict(compact=compact))
+            else:
+                ops_list.append(op.get_dict(compact=compact))
         return ops_list
 
     @classmethod
@@ -586,7 +595,7 @@ class Pipeline:
                 ...         }
                 ...     }
                 ... )
-                >>> config.save_to_yaml("pipeline.yaml")
+                >>> config.to_yaml("pipeline.yaml")
                 >>> pipeline = Pipeline.from_path("pipeline.yaml")
         """
         config = Config.from_path(file_path)
@@ -615,17 +624,17 @@ class Pipeline:
         """
         return pipeline_from_json(json_string, **kwargs)
 
-    def to_config(self, verbose=False) -> Config:
+    def to_config(self, compact=True) -> Config:
         """Convert the pipeline to a `zea.Config` object."""
-        return pipeline_to_config(self, verbose=verbose)
+        return pipeline_to_config(self, compact=compact)
 
-    def to_json(self, verbose=False) -> str:
+    def to_json(self, compact=True) -> str:
         """Convert the pipeline to a JSON string."""
-        return pipeline_to_json(self, verbose=verbose)
+        return pipeline_to_json(self, compact=compact)
 
-    def to_yaml(self, file_path: str, verbose=False) -> None:
+    def to_yaml(self, file_path: str, compact=True) -> None:
         """Convert the pipeline to a YAML file."""
-        pipeline_to_yaml(self, file_path, verbose=verbose)
+        pipeline_to_yaml(self, file_path, compact=compact)
 
     @property
     def key(self) -> str:
@@ -901,20 +910,20 @@ class Map(Pipeline):
         inputs.update(output)
         return inputs
 
-    def get_dict(self, verbose=False):
+    def get_dict(self, compact=True):
         """Get the configuration of the pipeline."""
-        config = super().get_dict(verbose=verbose)
+        config = super().get_dict(compact=compact)
         config["name"] = "map"
 
         params = config.get("params", {})
         params["argnames"] = self.argnames
-        if verbose or self.in_axes != 0:
+        if not compact or self.in_axes != 0:
             params["in_axes"] = self.in_axes
-        if verbose or self.out_axes != 0:
+        if not compact or self.out_axes != 0:
             params["out_axes"] = self.out_axes
-        if verbose or self.chunks is not None:
+        if not compact or self.chunks is not None:
             params["chunks"] = self.chunks
-        if verbose or self.batch_size is not None:
+        if not compact or self.batch_size is not None:
             params["batch_size"] = self.batch_size
         config["params"] = params
         return config
@@ -934,9 +943,9 @@ class PatchedGrid(Map):
         super().__init__(*args, argnames=["flatgrid", "flat_pfield"], chunks=num_patches, **kwargs)
         self.num_patches = num_patches
 
-    def get_dict(self, verbose=False):
+    def get_dict(self, compact=True):
         """Get the configuration of the pipeline."""
-        config = super().get_dict(verbose=verbose)
+        config = super().get_dict(compact=compact)
         config["name"] = "patched_grid"
 
         params = config.get("params", {})
@@ -1034,7 +1043,7 @@ class Beamform(Pipeline):
                 operations.append(operation.__class__.__name__)
         return f"<Beamform {self.name}=({', '.join(operations)})>"
 
-    def get_dict(self, verbose=False) -> dict:
+    def get_dict(self, compact=True) -> dict:
         """Convert the pipeline to a dictionary.
 
         Unlike Pipeline.get_dict(), this does NOT include the internal
@@ -1044,25 +1053,25 @@ class Beamform(Pipeline):
         config = {"name": "beamform"}
 
         params = {}
-        if verbose or self.beamformer_type != "delay_and_sum":
+        if not compact or self.beamformer_type != "delay_and_sum":
             params["beamformer"] = self.beamformer_type
-        if verbose or self.num_patches != 100:
+        if not compact or self.num_patches != 100:
             params["num_patches"] = self.num_patches
-        if verbose or self.enable_pfield:
+        if not compact or self.enable_pfield:
             params["enable_pfield"] = self.enable_pfield
 
         # Pipeline-level params
-        if verbose:
-            params["with_batch_dim"] = self.with_batch_dim
-            params["jit_options"] = self.jit_options
-            params["jit_kwargs"] = self._user_jit_kwargs
-        else:
+        if compact:
             if not self.with_batch_dim:
                 params["with_batch_dim"] = self.with_batch_dim
             if self.jit_options != "ops":
                 params["jit_options"] = self.jit_options
             if self._user_jit_kwargs:
                 params["jit_kwargs"] = self._user_jit_kwargs
+        else:
+            params["with_batch_dim"] = self.with_batch_dim
+            params["jit_options"] = self.jit_options
+            params["jit_kwargs"] = self._user_jit_kwargs
 
         if params:
             config["params"] = params
@@ -1260,12 +1269,22 @@ def pipeline_from_config(config: Config, **kwargs) -> Pipeline:
     """
     Create a Pipeline instance from a Config object.
 
-    The config should have a ``pipeline`` key containing an ``operations`` list.
-    A config with ``operations`` at the top level is also accepted.
+    The config must have a top-level ``pipeline`` key containing an ``operations`` list.
     """
-    # Unwrap the 'pipeline' key if present
-    if "pipeline" in config:
-        config = Config(config["pipeline"])
+    if "pipeline" not in config:
+        top_keys = list(config.keys()) if hasattr(config, "keys") else []
+        raise ValueError(
+            f"Cannot build Pipeline: missing top-level 'pipeline' key.\n"
+            f"Expected a config with the format:\n"
+            f"  pipeline:\n"
+            f"    operations:\n"
+            f"      - <operation_name>\n"
+            f"      - ...\n"
+            f"Found top-level keys: {top_keys}"
+        )
+
+    # Unwrap the pipeline subsection from a full config
+    config = Config(config["pipeline"])
 
     if "operations" not in config:
         top_keys = list(config.keys()) if hasattr(config, "keys") else []
@@ -1316,41 +1335,63 @@ def pipeline_from_yaml(yaml_path: str, **kwargs) -> Pipeline:  # pragma: no cove
     return pipeline_from_config(Config(pipeline_config), **kwargs)
 
 
-def _pipeline_to_serializable_dict(pipeline: Pipeline, verbose=False) -> dict:
+def _pipeline_to_serializable_dict(pipeline: Pipeline, compact=True) -> dict:
     """Convert a Pipeline to a dict suitable for serialization.
 
-    The output format is ``{"pipeline": {"operations": [<list of operation dicts>]}}``
+    The output format is ``{"pipeline": {"operations": [...], ...pipeline_kwargs}}``
     which can be loaded back via ``pipeline_from_config``.
     """
-    return {"pipeline": {"operations": Pipeline._pipeline_to_list(pipeline, verbose=verbose)}}
+    pipeline_dict = {
+        "operations": Pipeline._pipeline_to_list(pipeline, compact=compact),
+    }
+
+    if compact:
+        if not pipeline.with_batch_dim:
+            pipeline_dict["with_batch_dim"] = pipeline.with_batch_dim
+        if pipeline.jit_options != "ops":
+            pipeline_dict["jit_options"] = pipeline.jit_options
+        if pipeline._user_jit_kwargs:
+            pipeline_dict["jit_kwargs"] = pipeline._user_jit_kwargs
+        if pipeline.name != "pipeline":
+            pipeline_dict["name"] = pipeline.name
+    else:
+        pipeline_dict.update(
+            {
+                "with_batch_dim": pipeline.with_batch_dim,
+                "jit_options": pipeline.jit_options,
+                "jit_kwargs": pipeline._user_jit_kwargs,
+                "name": pipeline.name,
+            }
+        )
+
+    return {"pipeline": pipeline_dict}
 
 
-def pipeline_to_config(pipeline: Pipeline, verbose=False) -> Config:
+def pipeline_to_config(pipeline: Pipeline, compact=True) -> Config:
     """
     Convert a Pipeline instance into a Config object.
     """
-    return Config(_pipeline_to_serializable_dict(pipeline, verbose=verbose))
+    return Config(_pipeline_to_serializable_dict(pipeline, compact=compact))
 
 
-def pipeline_to_json(pipeline: Pipeline, verbose=False) -> str:
+def pipeline_to_json(pipeline: Pipeline, compact=True) -> str:
     """
     Convert a Pipeline instance into a JSON string.
     """
     return json.dumps(
-        _pipeline_to_serializable_dict(pipeline, verbose=verbose),
+        _pipeline_to_serializable_dict(pipeline, compact=compact),
         cls=ZEAEncoderJSON,
         indent=4,
     )
 
 
-def pipeline_to_yaml(pipeline: Pipeline, file_path: str, verbose=False) -> None:
+def pipeline_to_yaml(pipeline: Pipeline, file_path: str, compact=True) -> None:
     """
     Convert a Pipeline instance into a YAML file.
     """
     with open(file_path, "w", encoding="utf-8") as f:
-        yaml.dump(
-            _pipeline_to_serializable_dict(pipeline, verbose=verbose),
+        yaml.safe_dump(
+            _pipeline_to_serializable_dict(pipeline, compact=compact),
             f,
-            Dumper=yaml.Dumper,
             indent=4,
         )

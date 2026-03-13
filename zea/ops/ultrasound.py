@@ -41,11 +41,11 @@ class Simulate(Operation):
 
     # Define operation-specific static parameters
     STATIC_PARAMS = ["n_ax", "apply_lens_correction"]
+    ADD_OUTPUT_KEYS = ["n_ch"]
 
     def __init__(self, **kwargs):
         super().__init__(
             output_data_type=DataTypes.RAW_DATA,
-            additional_output_keys=["n_ch"],
             **kwargs,
         )
 
@@ -260,6 +260,18 @@ class ScanConvert(Operation):
     """Scan convert images to cartesian coordinates."""
 
     STATIC_PARAMS = ["fill_value"]
+    ADD_OUTPUT_KEYS = [
+        "resolution",
+        "x_lim",
+        "y_lim",
+        "z_lim",
+        "rho_range",
+        "theta_range",
+        "phi_range",
+        "d_rho",
+        "d_theta",
+        "d_phi",
+    ]
 
     def __init__(self, order=1, **kwargs):
         """Initialize the ScanConvert operation.
@@ -280,18 +292,6 @@ class ScanConvert(Operation):
             input_data_type=DataTypes.IMAGE,
             output_data_type=DataTypes.IMAGE_SC,
             jittable=jittable,
-            additional_output_keys=[
-                "resolution",
-                "x_lim",
-                "y_lim",
-                "z_lim",
-                "rho_range",
-                "theta_range",
-                "phi_range",
-                "d_rho",
-                "d_theta",
-                "d_phi",
-            ],
             **kwargs,
         )
         self.order = order
@@ -354,12 +354,13 @@ class Demodulate(Operation):
     """Demodulates the input data to baseband. After this operation, the carrier frequency
     is removed (0 Hz) and the data is in IQ format stored in two real valued channels."""
 
+    ADD_OUTPUT_KEYS = ["center_frequency", "n_ch"]
+
     def __init__(self, axis=-3, **kwargs):
         super().__init__(
             input_data_type=DataTypes.RAW_DATA,
             output_data_type=DataTypes.RAW_DATA,
             jittable=True,
-            additional_output_keys=["center_frequency", "n_ch"],
             **kwargs,
         )
         self.axis = axis
@@ -734,9 +735,10 @@ class Companding(Operation):
 class Downsample(Operation):
     """Downsample data along a specific axis."""
 
+    ADD_OUTPUT_KEYS = ["sampling_frequency", "n_ax"]
+
     def __init__(self, factor: int = 1, phase: int = 0, axis: int = -3, **kwargs):
         super().__init__(
-            additional_output_keys=["sampling_frequency", "n_ax"],
             **kwargs,
         )
         if factor < 1:

@@ -81,8 +81,10 @@ class GaussianBlur(Filter):
 class Normalize(Operation):
     """Normalize data to a given range."""
 
+    ADD_OUTPUT_KEYS = ["minval", "maxval"]
+
     def __init__(self, output_range=None, input_range=None, **kwargs):
-        super().__init__(additional_output_keys=["minval", "maxval"], **kwargs)
+        super().__init__(**kwargs)
         if output_range is None:
             output_range = (0, 1)
         self.output_range = self.to_float32(output_range)

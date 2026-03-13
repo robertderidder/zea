@@ -33,7 +33,7 @@ Example Usage
     >>> config.update_recursive({"data": {"dtype": "raw_data"}})
 
     >>> # Save to YAML
-    >>> config.save_to_yaml("new_config.yaml")
+    >>> config.to_yaml("new_config.yaml")
 
 .. testcleanup::
 
@@ -403,8 +403,8 @@ class Config(dict):
         """
         return Config(copy.deepcopy(self.as_dict()))
 
-    def save_to_yaml(self, path):
-        """Save config contents to yaml"""
+    def to_yaml(self, path):
+        """Save config contents to a YAML file."""
         with open(Path(path), "w", encoding="utf-8") as save_file:
             yaml.dump(
                 self.serialize(),
@@ -412,6 +412,11 @@ class Config(dict):
                 default_flow_style=False,
                 sort_keys=False,
             )
+
+    @deprecated(replacement="Config.to_yaml")
+    def save_to_yaml(self, path):
+        """Deprecated alias for :meth:`to_yaml`."""
+        self.to_yaml(path)
 
     def freeze(self):
         """Freeze config object.

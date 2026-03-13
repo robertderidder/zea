@@ -546,8 +546,8 @@ BEAMFORM_CONFIG = {
 }
 
 
-@pytest.mark.parametrize("verbose", [False, True])
-def test_beamform_config_roundtrip(verbose, tmp_path):
+@pytest.mark.parametrize("compact", [True, False])
+def test_beamform_config_roundtrip(compact, tmp_path):
     """Test that a beamform pipeline round-trips through config without expanding internals."""
     import yaml
 
@@ -555,7 +555,7 @@ def test_beamform_config_roundtrip(verbose, tmp_path):
     pipeline = pipeline_from_config(config, jit_options=None)
 
     # Config round-trip
-    new_config = pipeline.to_config(verbose=verbose)
+    new_config = pipeline.to_config(compact=compact)
     new_pipeline = pipeline_from_config(new_config, jit_options=None)
     assert isinstance(new_pipeline.operations[0], ops.Beamform)
     assert new_pipeline.operations[0].beamformer_type == "delay_and_sum"
@@ -564,14 +564,14 @@ def test_beamform_config_roundtrip(verbose, tmp_path):
     assert len(new_pipeline.operations) == 4
 
     # JSON round-trip
-    json_str = pipeline.to_json(verbose=verbose)
+    json_str = pipeline.to_json(compact=compact)
     json_pipeline = pipeline_from_json(json_str, jit_options=None)
     assert isinstance(json_pipeline.operations[0], ops.Beamform)
     assert json_pipeline.operations[0].num_patches == 200
 
     # YAML round-trip
     yaml_path = tmp_path / "beamform.yaml"
-    pipeline.to_yaml(yaml_path, verbose=verbose)
+    pipeline.to_yaml(yaml_path, compact=compact)
     yaml_pipeline = Pipeline.from_path(yaml_path, jit_options=None)
     assert isinstance(yaml_pipeline.operations[0], ops.Beamform)
     assert yaml_pipeline.operations[0].num_patches == 200
@@ -583,14 +583,14 @@ def test_beamform_config_roundtrip(verbose, tmp_path):
     assert "operations" not in beamform_entry, "Beamform should not serialize internal operations"
 
 
-@pytest.mark.parametrize("verbose", [False, True])
-def test_yaml_roundtrip_via_config_from_path(verbose, tmp_path):
+@pytest.mark.parametrize("compact", [True, False])
+def test_yaml_roundtrip_via_config_from_path(compact, tmp_path):
     """Test loading a saved YAML via Config.from_path → Pipeline.from_config."""
     config = Config(BEAMFORM_CONFIG)
     pipeline = pipeline_from_config(config, jit_options=None)
 
     yaml_path = tmp_path / "pipeline.yaml"
-    pipeline_to_yaml(pipeline, str(yaml_path), verbose=verbose)
+    pipeline_to_yaml(pipeline, str(yaml_path), compact=compact)
 
     # Load through Config.from_path (the path that was previously broken)
     loaded_config = Config.from_path(str(yaml_path))
@@ -619,8 +619,8 @@ def test_compact_output_omits_defaults():
     beamform_dict = compact["pipeline"]["operations"][0]
     assert beamform_dict == {"name": "beamform"}
 
-    verbose = pipeline.to_config(verbose=True)
-    beamform_dict = verbose["pipeline"]["operations"][0]
+    full = pipeline.to_config(compact=False)
+    beamform_dict = full["pipeline"]["operations"][0]
     assert "params" in beamform_dict
     assert beamform_dict["params"]["beamformer"] == "delay_and_sum"
     assert beamform_dict["params"]["num_patches"] == 100
@@ -672,7 +672,7 @@ def test_operation_subclass_params_serialized():
     assert "params" not in d_default
 
     # Verbose mode should include all params
-    d_verbose = ds_default.get_dict(verbose=True)
+    d_verbose = ds_default.get_dict(compact=False)
     assert d_verbose["params"]["factor"] == 1
     assert d_verbose["params"]["phase"] == 0
     assert d_verbose["params"]["axis"] == -3
@@ -1089,15 +1089,15 @@ def test_pipeline_get_dict_verbose_and_compact():
         jit_options=None,
         name="mypipe",
     )
-    compact = pipeline.get_dict(verbose=False)
+    compact = pipeline.get_dict(compact=True)
     assert compact["name"] == "pipeline"
     assert "operations" in compact
     # jit_options=None is non-default → should appear in compact
     assert compact["params"]["jit_options"] is None
 
-    verbose = pipeline.get_dict(verbose=True)
-    assert verbose["params"]["with_batch_dim"] is True
-    assert verbose["params"]["jit_options"] is None
+    full = pipeline.get_dict(compact=False)
+    assert full["params"]["with_batch_dim"] is True
+    assert full["params"]["jit_options"] is None
 
 
 def test_pipeline_load_from_yaml(tmp_path):
@@ -1179,13 +1179,13 @@ def test_map_get_dict():
         chunks=4,
         jit_options=None,
     )
-    d = m.get_dict(verbose=False)
+    d = m.get_dict(compact=True)
     assert d["name"] == "map"
     assert d["params"]["argnames"] == ["x"]
     assert d["params"]["in_axes"] == 1
     assert d["params"]["chunks"] == 4
 
-    d_v = m.get_dict(verbose=True)
+    d_v = m.get_dict(compact=False)
     assert d_v["params"]["out_axes"] == 0
     assert d_v["params"]["batch_size"] is None
 
@@ -1198,7 +1198,7 @@ def test_patched_grid_get_dict():
         num_patches=20,
         jit_options=None,
     )
-    d = pg.get_dict(verbose=False)
+    d = pg.get_dict(compact=True)
     assert d["name"] == "patched_grid"
     assert d["params"]["num_patches"] == 20
     assert "argnames" not in d["params"]
@@ -1219,3 +1219,93 @@ def test_get_dict_callable_param_raises():
     lam = ops.Lambda(lambda x: {"data": x + 1})
     with pytest.raises(TypeError, match="callable"):
         lam.get_dict()
+
+
+def test_add_output_keys_class_level_behavior():
+    """ADD_OUTPUT_KEYS should be read from class and not serialized as params."""
+    norm = ops.Normalize()
+    assert norm.additional_output_keys == ["minval", "maxval"]
+    assert norm.output_keys == [norm.output_key, "minval", "maxval"]
+
+    # internal class-level output metadata should not appear in serialized params
+    d = norm.get_dict(compact=False)
+    assert "additional_output_keys" not in d.get("params", {})
+
+
+def test_pipeline_roundtrip_preserves_pipeline_kwargs(tmp_path):
+    """Pipeline YAML round-trip should preserve top-level Pipeline settings."""
+    pipeline = Pipeline(
+        operations=[ops.Identity()],
+        with_batch_dim=False,
+        jit_options=None,
+        jit_kwargs={"my_flag": 1},
+        name="my_pipeline",
+    )
+
+    path = tmp_path / "pipeline.yaml"
+    pipeline.to_yaml(path)
+    loaded = Pipeline.from_path(path)
+
+    assert pipeline == loaded
+    assert loaded.with_batch_dim is False
+    assert loaded.jit_options is None
+    assert loaded.jit_kwargs["my_flag"] == 1
+    assert loaded.name == "my_pipeline"
+
+
+def test_pipeline_from_config_rejects_with_batch_dims_typo():
+    """Only `with_batch_dim` is accepted; typo `with_batch_dims` should fail."""
+    config = Config(
+        {
+            "pipeline": {
+                "operations": ["identity"],
+                "with_batch_dims": False,
+            },
+        }
+    )
+    with pytest.raises(TypeError, match="with_batch_dims"):
+        Pipeline.from_config(config)
+
+
+def test_pipeline_from_config_requires_pipeline_key():
+    """Top-level operations without a pipeline key should be rejected."""
+    config = Config({"operations": ["identity"]})
+    with pytest.raises(ValueError, match="missing top-level 'pipeline' key"):
+        Pipeline.from_config(config)
+
+
+def test_pipeline_yaml_is_portable_no_python_tuple_tag(tmp_path):
+    """pipeline.to_yaml should not emit Python-specific YAML tags."""
+    pipeline = Pipeline(
+        operations=[ops.Normalize(output_range=(0, 255))],
+        jit_options=None,
+    )
+    path = tmp_path / "portable.yaml"
+    pipeline.to_yaml(path)
+
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    assert "!!python/tuple" not in content
+
+
+def test_pipeline_jax_jit_kwargs_merge_preserves_user_keys(monkeypatch):
+    """When backend is JAX, static_argnames should merge with existing jit_kwargs."""
+
+    @ops_registry("static_param_test_op")
+    class StaticParamTestOp(ops.Operation):
+        STATIC_PARAMS = ["my_static"]
+
+        def call(self, **kwargs):
+            return {}
+
+    monkeypatch.setattr(keras.backend, "backend", lambda: "jax")
+
+    pipeline = Pipeline(
+        operations=[StaticParamTestOp()],
+        jit_options=None,
+        jit_kwargs={"donate_argnums": (0,), "static_argnames": "user_static"},
+    )
+
+    assert pipeline.jit_kwargs["donate_argnums"] == (0,)
+    assert set(pipeline.jit_kwargs["static_argnames"]) == {"user_static", "my_static"}
