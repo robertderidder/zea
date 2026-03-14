@@ -112,14 +112,61 @@ def simulate_rf(
     n_ax_rounded = _round_up_to_power_of_two(int(n_ax)).astype("float32")
 
     freqs = ops.arange(n_ax_rounded // 2 + 1, dtype="float32") / n_ax_rounded * sampling_frequency
+    freqs_broadcast = freqs[None, None, None]
 
-    waveform_spectrum = pulse_spectrum_fn(freqs)
+    waveform_spectrum = pulse_spectrum_fn(freqs)[None, None, None]
+
+    # Precompute geometry-dependent terms once per chunk; they do not depend on transmit.
+    dist_total = dist[:, None] + dist[:, :, None]
+    scat_pos_relative_to_probe = scatterer_positions[:, None] - probe_geometry[None]
+
+    theta = ops.arctan2(
+        scat_pos_relative_to_probe[:, :, 0], scat_pos_relative_to_probe[:, :, 2]
+    )
+    phi = ops.arctan2(scat_pos_relative_to_probe[:, :, 1], scat_pos_relative_to_probe[:, :, 2])
+
+    directivity_tx = directivity(
+        freqs_broadcast,
+        theta[..., None, None],
+        element_width,
+        sound_speed,
+    ) * directivity(
+        freqs_broadcast,
+        phi[..., None, None],
+        element_width,
+        sound_speed,
+    )
+    directivity_rx = directivity(
+        freqs_broadcast,
+        theta[:, None, :, None],
+        element_width,
+        sound_speed,
+    ) * directivity(
+        freqs_broadcast,
+        phi[:, None, :, None],
+        element_width,
+        sound_speed,
+    )
+
+    attenuation = attenuate(
+        freqs_broadcast,
+        attenuation_coef=attenuation_coef,
+        dist=dist_total[..., None],
+    )
+
+    spread_atten = spread(dist_total[..., None])
+    scatterer_response = ops.cast(
+        scatterer_magnitudes[:, None, None, None]
+        * directivity_tx
+        * directivity_rx
+        * attenuation
+        * spread_atten,
+        "complex64",
+    )
+
     parts = []
     for tx in range(n_tx):
         tx_idx = ops.array(tx)
-
-        # [n_scat, n_txel, rxel]
-        dist_total = dist[:, None] + dist[:, :, None]
 
         # [n_scat, n_txel, n_rxel]
         t0_delay_tx = ops.take(t0_delays, tx_idx, axis=0)
@@ -129,62 +176,19 @@ def simulate_rf(
             (dist_total / sound_speed) + t0_delay_tx[None, :, None] - initial_times_tx
         )
 
-        scat_pos_relative_to_probe = scatterer_positions[:, None] - probe_geometry[None]
-
-        # Compute 3D directivity
-        theta = ops.arctan2(
-            scat_pos_relative_to_probe[:, :, 0], scat_pos_relative_to_probe[:, :, 2]
-        )
-        phi = ops.arctan2(scat_pos_relative_to_probe[:, :, 1], scat_pos_relative_to_probe[:, :, 2])
-
-        directivity_tx = directivity(
-            freqs[None, None, None],
-            theta[..., None, None],
-            element_width,
-            sound_speed,
-        ) * directivity(
-            freqs[None, None, None],
-            phi[..., None, None],
-            element_width,
-            sound_speed,
-        )
-        directivity_rx = directivity(
-            freqs[None, None, None],
-            theta[:, None, :, None],
-            element_width,
-            sound_speed,
-        ) * directivity(
-            freqs[None, None, None],
-            phi[:, None, :, None],
-            element_width,
-            sound_speed,
-        )
-
-        attenuation = attenuate(
-            freqs[None, None, None],
-            attenuation_coef=attenuation_coef,
-            dist=dist_total[..., None],
-        )
-
-        spread_atten = spread(dist_total[..., None])
-
         result = (
-            waveform_spectrum[None, None, None]
+            waveform_spectrum
             * delay2(
-                freqs[None, None, None],
+                freqs_broadcast,
                 tau_total[..., None],
                 n_fft=n_ax_rounded,
                 sampling_frequency=sampling_frequency,
             )
             * ops.cast(
-                scatterer_magnitudes[:, None, None, None]
-                * tx_apodizations[tx, None, :, None, None]
-                * directivity_tx
-                * directivity_rx
-                * attenuation
-                * spread_atten,
+                tx_apodizations[tx, None, :, None, None],
                 "complex64",
             )
+            * scatterer_response
         )
 
         # Sum over all transmitting elements and scatterers
