@@ -377,9 +377,11 @@ class SimulatorPartialFFT(Operator):
     def sample_indices(self, seed):
         n_scat = len(self.positions)
         indices = jax.random.choice(seed, n_scat, (self.n_scat_per_it,), replace=False)
+        indices = jnp.sort(indices)
         return indices
     
     def forward(self,image, seed):
+        assert len(image.shape)==4, f"Image should be of shape [n_frames, H, W, 1] but got {image.shape}"
         image = ops.image.resize(image, self.shape) #Can I simply upscale the image? 
         scat_seed, el_seed, tx_seed, freq_seed = jax.random.split(seed, 4)   
 
