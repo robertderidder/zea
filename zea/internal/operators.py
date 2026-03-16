@@ -420,6 +420,29 @@ class SimulatorPartialFFT(Operator):
             ((0, n_scat_padded - n_scat), (0, 0))
         )
         
+        @jax.checkpoint
+        def checkpointed_fn(scat_chunk, amp_chunk, tx_indices, freq_indices, el_indices):
+            return simulate_rf(
+                        scatterer_positions=scat_chunk,
+                        scatterer_magnitudes=amp_chunk,
+                        el_indices=el_indices,
+                        freq_indices=freq_indices,
+                        tx_indices=tx_indices,
+                        probe_geometry=self.scan.probe_geometry,
+                        apply_lens_correction=self.scan.apply_lens_correction,
+                        sound_speed=self.scan.sound_speed,
+                        lens_sound_speed=self.scan.lens_sound_speed,
+                        lens_thickness=self.scan.lens_thickness,
+                        n_ax=self.scan.n_ax,
+                        center_frequency=self.scan.center_frequency,
+                        sampling_frequency=self.scan.sampling_frequency,
+                        t0_delays=self.scan.t0_delays,
+                        initial_times=self.scan.initial_times,
+                        element_width=self.scan.element_width,
+                        attenuation_coef=self.scan.attenuation_coef,
+                        tx_apodizations=self.scan.tx_apodizations,
+                )
+        
         def process_frame(frame_idx, rf_data_all):
             """Process one frame by looping over scatterer chunks."""
             amplitudes = magnitudes[frame_idx]
@@ -440,26 +463,7 @@ class SimulatorPartialFFT(Operator):
                 scat_chunk = ops.slice(positions_padded, (start, 0), (chunk_size, 3))
                 amp_chunk = ops.slice(amplitudes_padded, (start,), (chunk_size,))
                 
-                rf_chunk = simulate_rf(
-                        scatterer_positions=scat_chunk,
-                        scatterer_magnitudes=amp_chunk,
-                        el_indices=el_indices,
-                        freq_indices=freq_indices,
-                        tx_indices=tx_indices,
-                        probe_geometry=self.scan.probe_geometry,
-                        apply_lens_correction=self.scan.apply_lens_correction,
-                        sound_speed=self.scan.sound_speed,
-                        lens_sound_speed=self.scan.lens_sound_speed,
-                        lens_thickness=self.scan.lens_thickness,
-                        n_ax=self.scan.n_ax,
-                        center_frequency=self.scan.center_frequency,
-                        sampling_frequency=self.scan.sampling_frequency,
-                        t0_delays=self.scan.t0_delays,
-                        initial_times=self.scan.initial_times,
-                        element_width=self.scan.element_width,
-                        attenuation_coef=self.scan.attenuation_coef,
-                        tx_apodizations=self.scan.tx_apodizations,
-                )
+                rf_chunk = checkpointed_fn(scat_chunk, amp_chunk, tx_indices, freq_indices, el_indices)
                 
                 # RF is linear in amplitudes, so sum contributions
                 return rf_acc + rf_chunk

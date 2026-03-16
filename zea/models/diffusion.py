@@ -23,6 +23,7 @@ from typing import Literal
 import keras
 from keras import ops
 import jax.numpy as jnp
+import jax
 
 from zea.backend import _import_tf, jit
 from zea.backend.autograd import AutoGrad
@@ -889,7 +890,8 @@ class DPS_SIM(DiffusionGuidance):
     def setup(self):
         """Setup the autograd function for DPS."""
         self.autograd = AutoGrad()
-        self.autograd.set_function(self.compute_error)
+        checkpointed_error_fn = jax.checkpoint(self.compute_error)
+        self.autograd.set_function(checkpointed_error_fn)
         self.gradient_fn = self.autograd.get_gradient_and_value_jit_fn(
             has_aux=True,
             disable_jit=self.disable_jit,
