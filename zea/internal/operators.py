@@ -366,10 +366,7 @@ class SimulatorPartialFFT(Operator):
         self.n_tx_samples = n_tx_samples
         self.positions = jnp.reshape(self.scan.grid, (-1, 3))
         self.scatterer_chunk_size = scatterer_chunk_size
-        if n_scat_per_it == "all":
-            n_scat_per_it = self.positions.shape[0]
-        else:
-            self.n_scat_per_it = n_scat_per_it
+        self.n_scat_per_it = n_scat_per_it
     
     def img_to_magnitude(self,image):
         image = translate(image, range_from = (-1,1), range_to=self.scan.dynamic_range)
