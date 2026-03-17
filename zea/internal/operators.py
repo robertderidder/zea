@@ -15,7 +15,7 @@ import jax.numpy as jnp
 
 from zea.internal.core import Object
 from zea.internal.registry import operator_registry
-from zea.func import translate, fori_loop
+from zea.func import translate
 from zea.simulate_partial import simulate_partial_rf_data
 from zea.simulator_jax import simulate_partial_rf_data as sim_jax
 from zea.display import scan_convert, compute_scan_convert_2d_coordinates
@@ -413,75 +413,62 @@ class SimulatorPartialFFT(Operator):
         n_scat = positions.shape[0]
         chunk_size = self.scatterer_chunk_size
         n_scat_padded = n_scat + (chunk_size - (n_scat % chunk_size)) % chunk_size
-        
-        # Pad positions and use frame loop
-        positions_padded = ops.pad(
-            positions, 
-            ((0, n_scat_padded - n_scat), (0, 0))
-        )
-        
-        @jax.checkpoint
-        def checkpointed_fn(scat_chunk, amp_chunk, tx_indices, freq_indices, el_indices):
-            return simulate_rf(
-                        scatterer_positions=scat_chunk,
-                        scatterer_magnitudes=amp_chunk,
-                        el_indices=el_indices,
-                        freq_indices=freq_indices,
-                        tx_indices=tx_indices,
-                        probe_geometry=self.scan.probe_geometry,
-                        apply_lens_correction=self.scan.apply_lens_correction,
-                        sound_speed=self.scan.sound_speed,
-                        lens_sound_speed=self.scan.lens_sound_speed,
-                        lens_thickness=self.scan.lens_thickness,
-                        n_ax=self.scan.n_ax,
-                        center_frequency=self.scan.center_frequency,
-                        sampling_frequency=self.scan.sampling_frequency,
-                        t0_delays=self.scan.t0_delays,
-                        initial_times=self.scan.initial_times,
-                        element_width=self.scan.element_width,
-                        attenuation_coef=self.scan.attenuation_coef,
-                        tx_apodizations=self.scan.tx_apodizations,
-                )
-        
-        def process_frame(frame_idx, rf_data_all):
-            """Process one frame by looping over scatterer chunks."""
-            amplitudes = magnitudes[frame_idx]
-            
-            # Pad amplitudes for chunking
-            amplitudes_padded = ops.pad(
-                amplitudes,
-                (0, n_scat_padded - n_scat)
-            )
-            
-            # Initialize accumulated RF for this frame
-            rf_accum = ops.zeros([self.n_tx_samples, self.n_freq_samples, self.n_el_samples, 1], dtype='complex64')
-            
-            def process_scat_chunk(chunk_idx, rf_acc):
-                """Process one scatterer chunk and accumulate."""
-                start = chunk_idx * chunk_size
-                
-                scat_chunk = ops.slice(positions_padded, (start, 0), (chunk_size, 3))
-                amp_chunk = ops.slice(amplitudes_padded, (start,), (chunk_size,))
-                
-                rf_chunk = checkpointed_fn(scat_chunk, amp_chunk, tx_indices, freq_indices, el_indices)
-                
-                # RF is linear in amplitudes, so sum contributions
-                return rf_acc + rf_chunk
-            
-            # Loop over scatterer chunks and accumulate
-            n_chunks = n_scat_padded // chunk_size
-            rf_accum = fori_loop(0, n_chunks, process_scat_chunk, rf_accum)[None]
-            
-            # Write accumulated RF to output
-            rf_data_all = ops.slice_update(rf_data_all, (frame_idx, 0, 0, 0, 0), rf_accum)
-            return rf_data_all
-        
-        # Pre-allocate output: (n_frames, n_tx_sel, n_el_sel, n_freq_sel, 1)
-        output_shape = (n_frames, self.n_tx_samples, self.n_freq_samples, self.n_el_samples, 1)
-        rf_data_all = ops.zeros(output_shape, dtype='complex64')
+        n_chunks = n_scat_padded // chunk_size
 
-        # Process all frames with fori_loop
-        rf_data = fori_loop(0, n_frames, process_frame, rf_data_all)
+        # Pad and pre-reshape positions into (n_chunks, chunk_size, 3)
+        positions_padded = ops.pad(positions, ((0, n_scat_padded - n_scat), (0, 0)))
+        scat_chunks = ops.reshape(positions_padded, (n_chunks, chunk_size, 3))
+
+        def simulate_chunk(scat_chunk, amp_chunk):
+            """Simulate RF for a single scatterer chunk."""
+            return simulate_rf(
+                scatterer_positions=scat_chunk,
+                scatterer_magnitudes=amp_chunk,
+                el_indices=el_indices,
+                freq_indices=freq_indices,
+                tx_indices=tx_indices,
+                probe_geometry=self.scan.probe_geometry,
+                apply_lens_correction=self.scan.apply_lens_correction,
+                sound_speed=self.scan.sound_speed,
+                lens_sound_speed=self.scan.lens_sound_speed,
+                lens_thickness=self.scan.lens_thickness,
+                n_ax=self.scan.n_ax,
+                center_frequency=self.scan.center_frequency,
+                sampling_frequency=self.scan.sampling_frequency,
+                t0_delays=self.scan.t0_delays,
+                initial_times=self.scan.initial_times,
+                element_width=self.scan.element_width,
+                attenuation_coef=self.scan.attenuation_coef,
+                tx_apodizations=self.scan.tx_apodizations,
+            )
+
+        # Checkpoint the scan body functions so JAX recomputes their internals
+        # during the backward pass rather than storing all intermediate carry states.
+        # - accumulate_chunks: avoids storing n_chunks copies of rf_acc
+        # - process_frame: avoids storing n_frames (= batch_size * n_samples) copies of
+        #   intermediate activations — this is the dominant term that grows with n_samples.
+        @jax.checkpoint
+        def accumulate_chunks(rf_acc, chunk):
+            """Accumulate RF contribution from one scatterer chunk into carry."""
+            scat_chunk, amp_chunk = chunk
+            rf_acc = rf_acc + simulate_chunk(scat_chunk, amp_chunk)
+            return rf_acc, None
+
+        @jax.checkpoint
+        def process_frame(carry, frame_magnitudes):
+            """Scan over scatterer chunks for a single frame; output is the accumulated RF."""
+            amplitudes_padded = ops.pad(frame_magnitudes, (0, n_scat_padded - n_scat))
+            amp_chunks = ops.reshape(amplitudes_padded, (n_chunks, chunk_size))
+
+            rf_init = ops.zeros(
+                [self.n_tx_samples, self.n_freq_samples, self.n_el_samples, 1], dtype='complex64'
+            )
+            # Inner scan: accumulate RF over scatterer chunks (carry), no per-chunk output needed
+            rf_accum, _ = ops.scan(accumulate_chunks, rf_init, (scat_chunks, amp_chunks))
+            return carry, rf_accum
+
+        # Outer scan: xs = magnitudes (n_frames, n_scat); outputs stacked -> (n_frames, ...)
+        _, rf_data = ops.scan(process_frame, None, magnitudes)
         
         return rf_data, tx_indices, freq_indices, el_indices
     
