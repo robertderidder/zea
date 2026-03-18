@@ -378,8 +378,22 @@ class Parameters(ZeaObject):
                                 continue
                         except (TypeError, ValueError):
                             pass  # fall through to setattr
-                    elif old_val == new_val:
-                        continue
+                    else:
+                        try:
+                            eq = old_val == new_val
+                        except (TypeError, ValueError):
+                            eq = None
+
+                        if isinstance(eq, (bool, np.bool_)):
+                            if eq:
+                                continue
+                        elif eq is not None:
+                            try:
+                                if np.all(eq):
+                                    continue
+                            except Exception:
+                                # If np.all fails (non-array-like result), fall through
+                                pass
 
             setattr(self, key, new_val)
 
