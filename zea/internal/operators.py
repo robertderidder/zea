@@ -208,7 +208,7 @@ class SimulatorPartialFFT(Operator):
                  n_tx_samples = 5, 
                  n_freq_samples = 10, 
                  n_el_samples = 10, 
-                 scatterer_chunk_size = 32, 
+                 scatterer_chunk_size = 256, 
                  n_scat_per_it = None):
         super().__init__()
         self.scan = scan
@@ -224,10 +224,13 @@ class SimulatorPartialFFT(Operator):
         else:
             self.n_scat_per_it = int(n_scat_per_it)
     
-    def img_to_magnitude(self,image):
+    def img_to_magnitude(self,image, n_frames):
         image = translate(image, range_from = (-1,1), range_to=self.scan.dynamic_range)
         image_lin = 10**(image/20)
-        image_lin = ops.where(image==self.scan.dynamic_range[-1], 0, image_lin)
+        image_lin = ops.reshape(image_lin, (n_frames, -1))
+        #set amplitudes to 0 if scan.grid has z<0
+        mask = ops.logical_not(self.positions[:,2] < 0)[None,:]
+        image_lin = mask * image_lin
         return image_lin
     
     def sample_indices(self, seed):
@@ -244,14 +247,13 @@ class SimulatorPartialFFT(Operator):
         scat_seed, el_seed, tx_seed, freq_seed = split_seed(seed, 4)   
 
         n_frames, *img_shape = image.shape
-        magnitudes = self.img_to_magnitude(image)
-        magnitudes = ops.reshape(magnitudes, (n_frames, -1))
+        magnitudes = self.img_to_magnitude(image, n_frames)
 
         scat_indices = self.sample_indices(scat_seed)
 
         positions = ops.take(self.positions, scat_indices, axis=0)
         magnitudes = ops.take(magnitudes, scat_indices, axis=1)
-        
+
         # Uniform sampling without replacement for elements and transmits
         el_random = keras.random.uniform(shape=(self.scan.n_el,), seed=el_seed)
         el_indices = ops.argsort(el_random)[:self.n_el_samples]
@@ -267,6 +269,7 @@ class SimulatorPartialFFT(Operator):
         probs = ops.exp(-0.5 * ((freq_bins - self.n_freqs/2) / std_bins) ** 2)
         probs = probs / probs.sum()
         
+        #Apply Gumbel-max trick for sampling without replacement according to probs
         log_probs = ops.log(ops.maximum(probs, 1e-10))  # Avoid log(0)
         gumbel = -ops.log(-ops.log(keras.random.uniform(shape=(self.n_freqs,), seed=freq_seed)) + 1e-10)
         freq_indices = ops.argsort(-(log_probs + gumbel))[:self.n_freq_samples]
