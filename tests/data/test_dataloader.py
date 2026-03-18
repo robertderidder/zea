@@ -1,4 +1,4 @@
-"""Test Tensorflow H5 dataloader functions"""
+"""Test H5 dataloader functions"""
 
 import hashlib
 import pickle
@@ -11,7 +11,7 @@ import pytest
 from keras import ops
 
 from zea import log
-from zea.backend.tensorflow.dataloader import make_dataloader
+from zea.data.dataloader import Dataloader
 from zea.data.augmentations import RandomCircleInclusion
 from zea.data.dataloader import MAX_RETRY_ATTEMPTS, H5Generator
 from zea.data.datasets import Dataset
@@ -185,7 +185,7 @@ def test_dataloader(
         [length // n_frames if not insert_frame_axis else length for length in file_lengths]
     )
 
-    dataset = make_dataloader(
+    dataset = Dataloader(
         directory,
         batch_size=1,
         key=key,
@@ -216,15 +216,19 @@ def test_dataloader(
         f" is not equal to the expected length {expected_len_dataset}"
     )
 
-    # Test shuffling
-    shuffle_key = {}
-    for i in range(2):
-        shuffle_key[i] = ""
+    # Test shuffling — with very few samples different seeds can produce the
+    # same permutation, iterate several times and require that at least
+    # one pair differs.
+    n_shuffle_iters = 5
+    shuffle_keys = []
+    for _ in range(n_shuffle_iters):
+        h = ""
         for batch in iter(dataset):
             key = hashlib.md5(pickle.dumps(batch)).hexdigest()
-            shuffle_key[i] += key
+            h += key
+        shuffle_keys.append(h)
 
-    assert shuffle_key[0] != shuffle_key[1], "The dataset was not shuffled"
+    assert len(set(shuffle_keys)) > 1, "The dataset was not shuffled"
 
 
 @pytest.mark.parametrize(
@@ -250,7 +254,7 @@ def test_h5_dataset_return_filename(
     validate = directory != "dummy_hdf5"
     directory = request.getfixturevalue(directory)
 
-    dataset = make_dataloader(
+    dataset = Dataloader(
         directory,
         key=key,
         image_size=image_size,
@@ -275,7 +279,7 @@ def test_h5_dataset_return_filename(
     )
 
     file_dict = file_dict[0]  # get the first file_dict of the batch
-    file_dict = json_loads(file_dict.numpy())
+    file_dict = json_loads(file_dict)
 
     filename = file_dict["filename"]
     assert isinstance(filename, str), "The filename should be a string"
@@ -309,7 +313,7 @@ def test_h5_dataset_resize_types(directory, key, image_size, resize_type, batch_
     validate = directory != "dummy_hdf5"
     directory = request.getfixturevalue(directory)
 
-    dataset = make_dataloader(
+    dataset = Dataloader(
         directory,
         key=key,
         image_size=image_size,
@@ -405,7 +409,7 @@ def test_ndim_hdf5_dataset(
 ):
     """Test the dataloader with an n-dimensional HDF5 dataset."""
 
-    dataset = make_dataloader(
+    dataset = Dataloader(
         ndim_hdf5_dataset_path,
         key=key,
         image_size=image_size,
@@ -500,7 +504,7 @@ def test_random_circle_inclusion_augmentation(dummy_hdf5):
         ]
     )
 
-    dataset = make_dataloader(
+    dataset = Dataloader(
         dummy_hdf5,
         batch_size=4,
         key="data",
@@ -535,7 +539,7 @@ def test_resize_with_different_shapes(multi_shape_dataset):
     """Test the dataloader class with different image shapes in a batch."""
 
     # Create a dataloader instance with different image shapes
-    dataset = make_dataloader(
+    dataset = Dataloader(
         multi_shape_dataset,
         key="data",
         image_size=(16, 16),

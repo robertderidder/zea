@@ -20,11 +20,8 @@ Example:
             ...
 """
 
-import os
 import re
 import threading
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 from itertools import product
 from pathlib import Path
 from typing import List, Tuple, Union
@@ -481,9 +478,15 @@ class H5DataSource:
         overlapping_blocks: bool = False,
         limit_n_samples: int | None = None,
         limit_n_frames: int | None = None,
+        return_filename: bool = False,
+        cache: bool = False,
         validate: bool = True,
         **kwargs,
     ):
+        self.return_filename = return_filename
+        self.cache = cache
+        self._data_cache = {}
+
         self.key = key
         self.n_frames = int(n_frames)
         self.frame_index_stride = int(frame_index_stride)
@@ -544,12 +547,32 @@ class H5DataSource:
     def __len__(self) -> int:
         return len(self.indices)
 
-    def __getitem__(self, index: int) -> np.ndarray:
+    def __getitem__(self, index: int):
         """Return a single sample as a numpy array. Thread-safe."""
+        if self.cache and index in self._data_cache:
+            return self._data_cache[index]
+
         file_name, key, indices = self.indices[index]
-        cache = self._get_cache()
-        file = cache.get_file(file_name)
-        return self._load(file, key, indices)
+        file_cache = self._get_cache()
+        file = file_cache.get_file(file_name)
+        image = self._load(file, key, indices)
+
+        if self.return_filename:
+            file_data = json_dumps(
+                {
+                    "fullpath": file.filename,
+                    "filename": Path(file_name).stem,
+                    "indices": indices,
+                }
+            )
+            result = (image, file_data)
+        else:
+            result = image
+
+        if self.cache:
+            self._data_cache[index] = result
+
+        return result
 
     def __repr__(self) -> str:
         return (
@@ -597,182 +620,6 @@ class H5DataSource:
             cache.close()
 
 
-# ── Keras GPU transforms (layers + ops) ──────────────────────────────────────
-
-
-def _build_gpu_transform_fn(
-    *,
-    image_size: tuple | None = None,
-    resize_type: str | None = None,
-    image_range: tuple | None = None,
-    normalization_range: tuple | None = None,
-    clip_image_range: bool = False,
-    augmentation: callable = None,
-):
-    """Return a single callable that applies all transforms on-device.
-
-    Uses ``keras.layers.Resizing``, ``keras.layers.CenterCrop``, etc.
-    (via :class:`zea.data.layers.Resizer`) for spatial transforms and
-    ``keras.ops`` for clipping and normalization.
-
-    All configuration is captured in the closure so the returned function
-    has signature ``tensor -> tensor`` with zero lookup overhead.
-    """
-    steps = []
-
-    # Clip ------------------------------------------------------------------
-    if clip_image_range and image_range is not None:
-        lo, hi = image_range
-        steps.append(lambda t: keras.ops.clip(t, lo, hi))
-
-    # Resize / crop / pad ---------------------------------------------------
-    if image_size is not None and resize_type is not None:
-        resizer = Resizer(image_size, resize_type)
-        steps.append(resizer)
-
-    # Normalize -------------------------------------------------------------
-    if normalization_range is not None and image_range is not None:
-        left_min, left_max = image_range
-        right_min, right_max = normalization_range
-        # Rescaling: scale * x + offset
-        scale = (right_max - right_min) / (left_max - left_min)
-        offset = right_min - scale * left_min
-        rescaler = keras.layers.Rescaling(scale=scale, offset=offset)
-        steps.append(rescaler)
-
-    # Augmentation ----------------------------------------------------------
-    if augmentation is not None:
-        steps.append(augmentation)
-
-    if not steps:
-        return None
-
-    def _apply(tensor):
-        for step in steps:
-            tensor = step(tensor)
-        return tensor
-
-    return _apply
-
-
-def _make_transfer_fn(device: str | None = None):
-    """Build a closure that transfers a numpy array to a backend device.
-
-    All imports and device resolution happen **once** when this function is
-    called.  The returned closure captures the resolved objects directly,
-    so the per-batch hot path has zero import overhead.
-
-    Args:
-        device: Target device string, e.g. ``"gpu:0"``, ``"cuda:1"``,
-            ``"cpu"``.  ``None`` uses the framework default.
-
-    Returns:
-        ``(np.ndarray) -> tensor`` callable.
-    """
-    backend_name = keras.backend.backend()
-
-    if backend_name == "jax":
-        import jax
-        import jax.numpy as jnp
-
-        if device is not None:
-            from zea.backend.jax import str_to_jax_device
-
-            jax_device = str_to_jax_device(device)
-            return lambda array: jax.device_put(jnp.asarray(array), jax_device)
-        return lambda array: jax.device_put(jnp.asarray(array))
-
-    elif backend_name == "torch":
-        import torch
-
-        if device is not None:
-            torch_device = torch.device(device.replace("gpu", "cuda"))
-        else:
-            torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        return lambda array: torch.as_tensor(array).to(torch_device, non_blocking=True)
-
-    elif backend_name == "tensorflow":
-        import tensorflow as tf
-
-        if device is not None:
-            tf_device = device.replace("cuda", "gpu")
-
-            def _tf_transfer(array):
-                with tf.device(tf_device):
-                    return tf.constant(array)
-
-            return _tf_transfer
-        return lambda array: tf.constant(array)
-
-    else:
-        # numpy or unknown backend – return as-is
-        return lambda array: array
-
-
-class _PrefetchToDevice:
-    """Iterator wrapper that transfers batches to a device one step ahead.
-
-    While the caller processes batch *N* on the GPU, this wrapper already
-    initiates the host-to-device copy for batch *N+1* in a background
-    thread.  This overlaps data transfer with computation, hiding the
-    CPU-to-GPU latency.
-
-    Args:
-        iterator: The source iterator yielding numpy arrays.
-        device: Target device string passed to :func:`_make_transfer_fn`.
-        prefetch_size: How many batches to keep in flight (default 2).
-        gpu_transform: Optional ``tensor -> tensor`` callable executed
-            on-device immediately after the host-to-device copy.
-    """
-
-    def __init__(
-        self,
-        iterator,
-        device: str | None = None,
-        prefetch_size: int = 2,
-        gpu_transform: callable = None,
-    ):
-        self._iterator = iter(iterator)
-        self._prefetch_size = prefetch_size
-        self._buffer: deque = deque()
-        self._executor = ThreadPoolExecutor(max_workers=1)
-        self._exhausted = False
-        # Resolve imports and device once — the closure is import-free
-        self._transfer = _make_transfer_fn(device)
-        self._gpu_transform = gpu_transform
-        # Pre-fill the buffer
-        self._fill()
-
-    def _transfer_and_transform(self, batch):
-        """Transfer *batch* to device, then apply GPU transforms."""
-        tensor = self._transfer(batch)
-        if self._gpu_transform is not None:
-            tensor = self._gpu_transform(tensor)
-        return tensor
-
-    def _fill(self):
-        """Submit transfer jobs until the buffer reaches *prefetch_size*."""
-        while len(self._buffer) < self._prefetch_size and not self._exhausted:
-            try:
-                batch = next(self._iterator)
-            except StopIteration:
-                self._exhausted = True
-                break
-            future = self._executor.submit(self._transfer_and_transform, batch)
-            self._buffer.append(future)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        self._fill()
-        if not self._buffer:
-            self._executor.shutdown(wait=False)
-            raise StopIteration
-        future = self._buffer.popleft()
-        return future.result()
-
-
 class Dataloader:
     """High-performance HDF5 dataloader built on `Grain <https://github.com/google/grain>`_.
 
@@ -786,12 +633,30 @@ class Dataloader:
     The entire pipeline runs in numpy — no framework dependency until
     you feed tensors to your model.
 
+    Does the following in order to load a dataset:
+
+        - Find all .hdf5 files in the director(ies)
+        - Load the data from each file using the specified key
+        - Apply the following transformations in order (if specified):
+
+            - shuffle
+            - shard
+            - add channel dim
+            - clip_image_range
+            - assert_image_range
+            - resize
+            - repeat
+            - batch
+            - normalize
+            - augmentation
+
     Args:
         file_paths: Path(s) to HDF5 directory(ies) or file(s).
         key: HDF5 dataset key.
         batch_size: Batch size. ``None`` disables batching.
         n_frames: Consecutive frames per sample.
         shuffle: Shuffle data each epoch.
+        return_filename: Return filename metadata with each sample.
         seed: Random seed for shuffling.
         limit_n_samples: Cap number of samples.
         limit_n_frames: Cap frames per file.
@@ -799,20 +664,26 @@ class Dataloader:
         image_size: ``(H, W)`` target size.
         resize_type: ``"resize"``, ``"center_crop"``, ``"random_crop"``
             or ``"crop_or_pad"``.
+        resize_axes: Axes to resize along. Should be of length 2
+            (height, width). Only needed when data has more than (h, w, c)
+            dimensions.
+        resize_kwargs: Additional keyword arguments for the resize operation.
         image_range: Original value range of images, e.g. ``(-60, 0)``.
         normalization_range: Target value range, e.g. ``(0, 1)``.
         clip_image_range: Clip values to ``image_range`` before normalizing.
+        assert_image_range: Assert that data is within ``image_range``.
         dataset_repetitions: Repeat dataset N times (``None`` = infinite).
+        cache: Cache loaded samples to RAM.
         additional_axes_iter: Extra axes to iterate over.
         sort_files: Sort files numerically.
         overlapping_blocks: Allow overlapping frame blocks.
-        augmentation: A callable applied per-batch *after* normalization,
-            executed on-device via keras ops (must accept/return tensors).
+        augmentation: A callable applied per-batch *after* normalization.
         initial_frame_axis: Source frame axis in the file.
         insert_frame_axis: Insert new frame axis.
         frame_index_stride: Stride between frames.
         frame_axis: Axis for stacking frames.
         validate: Validate dataset against the zea format.
+        prefetch: Prefetch the dataset.
         shard_index: Shard index for distributed training.
         num_shards: Total number of shards.
         num_threads: Threads for parallel reads (0 = main thread only).
@@ -840,25 +711,31 @@ class Dataloader:
         batch_size: int | None = 16,
         n_frames: int = 1,
         shuffle: bool = True,
+        return_filename: bool = False,
         seed: int | None = None,
         limit_n_samples: int | None = None,
         limit_n_frames: int | None = None,
         drop_remainder: bool = False,
         image_size: tuple | None = None,
         resize_type: str | None = None,
+        resize_axes: tuple | None = None,
+        resize_kwargs: dict | None = None,
         image_range: tuple | None = None,
         normalization_range: tuple | None = None,
         clip_image_range: bool = False,
+        assert_image_range: bool = True,
         dataset_repetitions: int | None = None,
+        cache: bool = False,
         additional_axes_iter: tuple | None = None,
         sort_files: bool = True,
         overlapping_blocks: bool = False,
         augmentation: callable = None,
         initial_frame_axis: int = 0,
-        insert_frame_axis: bool = False,
+        insert_frame_axis: bool = True,
         frame_index_stride: int = 1,
         frame_axis: int = -1,
         validate: bool = True,
+        prefetch: bool = True,
         shard_index: int | None = None,
         num_shards: int = 1,
         num_threads: int = 16,
@@ -876,16 +753,14 @@ class Dataloader:
             assert shard_index is not None, "shard_index must be specified"
             assert 0 <= shard_index < num_shards
 
+        resize_kwargs = resize_kwargs or {}
+
         # ── Store config ──────────────────────────────────────────────
         self.batch_size = batch_size
-        self.image_size = image_size
-        self.resize_type = resize_type or ("resize" if image_size else None)
-        self.image_range = image_range
-        self.normalization_range = normalization_range
-        self.clip_image_range = clip_image_range
-        self.augmentation = augmentation
+        self.return_filename = return_filename
         self.num_threads = num_threads
         self.prefetch_buffer_size = prefetch_buffer_size
+        self.prefetch = prefetch
         self.shuffle = shuffle
 
         # Grain requires a concrete seed for shuffle — generate one if needed
@@ -908,23 +783,60 @@ class Dataloader:
             overlapping_blocks=overlapping_blocks,
             limit_n_samples=limit_n_samples,
             limit_n_frames=limit_n_frames,
+            return_filename=return_filename,
+            cache=cache,
             validate=validate,
             **kwargs,
         )
+
+        # Helper to apply transforms to images only (preserving filenames)
+        def _ds_map(ds, fn):
+            if return_filename:
+                return ds.map(lambda item: (fn(item[0]), item[1]))
+            return ds.map(fn)
 
         # ── Build Grain pipeline ──────────────────────────────────────
         ds = grain.MapDataset.source(self.source)
 
         # Shuffle (before sharding, so every shard sees different order)
+        self._shuffle_node = None
         if shuffle:
             ds = ds.shuffle(seed=seed)
+            self._shuffle_node = ds
 
         # Shard
         if num_shards > 1:
             ds = ds[shard_index::num_shards]
 
-        # Ensure channel dim on CPU (needed for uniform batching)
-        ds = ds.map(self._ensure_channel_dim)
+        # Ensure channel dim (needed for uniform batching)
+        ds = _ds_map(ds, self._ensure_channel_dim)
+
+        # Clip to image range
+        if clip_image_range and image_range is not None:
+            lo, hi = image_range
+            ds = _ds_map(ds, lambda x, _lo=lo, _hi=hi: keras.ops.clip(x, _lo, _hi))
+
+        # Assert image range
+        if assert_image_range and image_range is not None:
+            _ir = image_range
+            ds = _ds_map(ds, lambda x, _r=_ir: Dataloader._assert_image_range(x, _r))
+
+        # Resize
+        if image_size or resize_type:
+            resize_type = resize_type or "resize"
+            if frame_axis != -1:
+                assert resize_axes is not None, (
+                    "Resizing only works with frame_axis = -1. Alternatively, "
+                    "you can specify resize_axes."
+                )
+            resizer = Resizer(
+                image_size=image_size,
+                resize_type=resize_type,
+                resize_axes=resize_axes,
+                seed=seed,
+                **resize_kwargs,
+            )
+            ds = _ds_map(ds, resizer)
 
         # Repeat
         if dataset_repetitions is not None:
@@ -933,6 +845,15 @@ class Dataloader:
         # Batch
         if batch_size is not None:
             ds = ds.batch(batch_size=batch_size, drop_remainder=drop_remainder)
+
+        # Normalize
+        if normalization_range is not None:
+            _ir, _nr = image_range, normalization_range
+            ds = _ds_map(ds, lambda x, _a=_ir, _b=_nr: Dataloader._normalize(x, _a, _b))
+
+        # Augmentation
+        if augmentation is not None:
+            ds = _ds_map(ds, augmentation)
 
         self._map_dataset = ds
 
@@ -952,26 +873,15 @@ class Dataloader:
         return self._map_dataset.to_iter_dataset(
             grain.ReadOptions(
                 num_threads=self.num_threads,
-                prefetch_buffer_size=self.prefetch_buffer_size,
+                prefetch_buffer_size=self.prefetch_buffer_size if self.prefetch else 0,
             )
         )
 
     def __iter__(self):
-        it = self.to_iter_dataset()
-        device = os.environ.get("CUDA_VISIBLE_DEVICES")
-
-        gpu_transform_fn = _build_gpu_transform_fn(
-            image_size=self.image_size,
-            resize_type=self.resize_type,
-            image_range=self.image_range,
-            normalization_range=self.normalization_range,
-            clip_image_range=self.clip_image_range,
-            augmentation=self.augmentation,
-        )
-
-        if device is not None or gpu_transform_fn is not None:
-            return _PrefetchToDevice(it, device=device, gpu_transform=gpu_transform_fn)
-        return iter(it)
+        # Re-seed the shuffle node so each epoch sees a different order
+        if self._shuffle_node is not None:
+            self._shuffle_node._seed = int(self._rng.integers(0, 2**31))
+        return iter(self.to_iter_dataset())
 
     def __len__(self):
         """Number of batches (or samples if unbatched)."""
@@ -987,11 +897,35 @@ class Dataloader:
         )
 
     @staticmethod
-    def _ensure_channel_dim(image: np.ndarray) -> np.ndarray:
+    def _ensure_channel_dim(image):
         """Ensure at least 3-D (H, W, C) so batching produces uniform shapes."""
-        if image.ndim < 3:
-            image = image[..., np.newaxis]
+        if len(keras.ops.shape(image)) < 3:
+            return keras.ops.expand_dims(image, axis=-1)
         return image
+
+    @staticmethod
+    def _assert_image_range(image, image_range):
+        """Assert that image values are within the specified range."""
+        minval = float(keras.ops.min(image))
+        maxval = float(keras.ops.max(image))
+        if minval < image_range[0]:
+            raise ValueError(
+                f"Image min {minval} is below image_range lower bound {image_range[0]}"
+            )
+        if maxval > image_range[1]:
+            raise ValueError(
+                f"Image max {maxval} is above image_range upper bound {image_range[1]}"
+            )
+        return image
+
+    @staticmethod
+    def _normalize(image, image_range, normalization_range):
+        """Normalize image from image_range to normalization_range."""
+        left_min, left_max = image_range
+        right_min, right_max = normalization_range
+        scale = (right_max - right_min) / (left_max - left_min)
+        offset = right_min - scale * left_min
+        return keras.ops.add(keras.ops.multiply(image, scale), offset)
 
     def summary(self):
         """Print dataset statistics and per-directory breakdown."""
