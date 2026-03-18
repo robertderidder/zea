@@ -11,14 +11,11 @@ import numpy as np
 import keras
 from keras import ops
 import jax
-import jax.numpy as jnp
 
 from zea.internal.core import Object
 from zea.internal.registry import operator_registry
 from zea.func import translate
-from zea.simulate_partial import simulate_partial_rf_data
-from zea.simulator_jax import simulate_partial_rf_data as sim_jax
-from zea.display import scan_convert, compute_scan_convert_2d_coordinates
+from zea.func.tensor import split_seed
 
 from zea.simulator_zea_partial import simulate_rf
 
@@ -206,167 +203,26 @@ class FourierBlurOperator(Operator):
     def __str__(self):
         return f"y = F^(-1)(M * F(x)) filter at {self.cutoff_freq}"
 
-@operator_registry(name="simulator_partial")
-class SimulatorPartial(Operator):
-    """
-    Operator for simulating RF data from an image.
-    The operator is initialized with fixed scan parameters.
-    The forward operator takes a logcompressed image, normalized between -1 and 1
-    It is then translated to dynamic range and log uncompressed and generates rf_data
-    """
-
-    def __init__(self, scan, shape, n_ax_samples=10, n_el_samples=10, n_tx_samples=None, wavefront_only=False):
-        super().__init__()
-        self.scan = scan
-        self.shape = shape
-        self.positions = self.compute_scatterer_positions()
-        self.n_ax_samples = n_ax_samples
-        self.n_el_samples = n_el_samples
-        self.n_tx_samples = n_tx_samples
-        self.wavefront_only = wavefront_only
-
-    def compute_scatterer_positions(self):
-        """
-        Computes the Cartesian coordinates of every scatterer (pixel) in the
-        polar image that the operator is initialised with.
-
-        The input image is assumed to live in ρ–θ space; the rows correspond to
-        radial samples between ``scan.rho_range`` and the columns to angles
-        between the first and last value of ``scan.polar_angles``.  The
-        transformation performed here is identical to the one performed by
-        :func:`zea.display.scan_convert_2d` when it is used with the same
-        scan parameters; this means that the positions returned here are the
-        physical (x,y,z) locations beneath the probe.  Only the x and z
-        components are passed to the JAX simulator – the y coordinate is
-        zero.
-        """
-        if self.scan.grid_type == "polar":
-            rho_range = self.scan.rho_range
-
-            theta_range = (
-                self.scan.polar_angles[0],
-                self.scan.polar_angles[-1],
-            )
-
-            # image shape may be (H,W) or (H,W,1) etc.
-            assert len(self.shape) == 2, f"Shape must be of form H, W, got {self.shape}"
-            H = self.shape[0]
-            W = self.shape[1]
-
-            # 1. Create rho-theta grid
-            rho = ops.linspace(rho_range[0], rho_range[1], H)
-            theta = ops.linspace(theta_range[0], theta_range[1], W)
-
-            #Frustrum rt2xz transformation
-            rho_grid, theta_grid = ops.meshgrid(rho, theta, indexing="ij")
-
-            z_grid = rho_grid / ops.sqrt(1 + ops.tan(theta_grid) ** 2)
-            x_grid = z_grid * ops.tan(theta_grid)  
-            z_grid = z_grid - self.scan.distance_to_apex
-
-            n_pixels = H*W
-            x_vec = ops.reshape(x_grid, (n_pixels,))
-            y_vec = ops.zeros_like(x_vec)
-            z_vec = ops.reshape(z_grid, (n_pixels,))
-
-            positions = ops.stack([x_vec, y_vec, z_vec], axis=1)
-        elif self.scan.grid_type == "cartesian":
-            """
-            Compute scatterer positions for each pixel in the image, using scan x/z limits and image shape.
-            Returns an array of shape (n_pixels, 3) with [x, y, z] positions.
-            """
-            x_start, x_end = self.scan.xlims
-            z_start, z_end = self.scan.zlims
-            if len(self.shape) == 2:
-                H, W = self.shape[0], self.shape[1]
-            elif len(self.shape) == 3:
-                H, W = self.shape[0], self.shape[1]
-            elif len(self.shape) == 4:
-                B, H, W = self.shape[0], self.shape[1], self.shape[2]
-            else:
-                raise ValueError(f"Expected a shape of lenght 2, 3, or 4, instead got {self.shape}") 
-            
-            x = ops.linspace(x_start, x_end, H)
-            z = ops.linspace(z_start, z_end, W)
-            xv, zv = ops.meshgrid(x, z, indexing='ij')
-            x_flat = ops.reshape(xv, [-1])
-            z_flat = ops.reshape(zv, [-1])
-            y_flat = ops.zeros_like(x_flat)
-            positions = ops.stack([x_flat, y_flat, z_flat], axis=1)
-        else:
-            raise ValueError(f"Invalid grid type {self.scan.grid_type}. Expected 'polar' or 'cartesian'.")
-        return positions
-    
-    def img_to_magnitude(self,image):
-        image = translate(image, range_from = (-1,1), range_to=self.scan.dynamic_range)
-        image_lin = 10**(image/20)
-        return image_lin
-
-    def forward(self, image, seed=None, **kwargs):
-        """
-        Simulates RF data from the input images.
-        Image magnitudes have values between -1 and 1
-        Each pixel is a scatterer, pixel value is magnitude.
-        """
-        assert len(image.shape)==4, f"Image should be of shape [n_frames, H, W, 1] but got {image.shape}"
-        if seed is None:
-            raise ValueError("A random seed must be provided.")
-        n_frames, *img_shape = image.shape
-        magnitudes = self.img_to_magnitude(image)
-        magnitudes = ops.reshape(magnitudes, (n_frames, -1))
-
-        ax_indices = jax.random.choice(seed,self.scan.n_ax,(self.n_ax_samples,),replace=False)
-        el_indices = jax.random.choice(seed,self.scan.n_el,(self.n_el_samples,),replace=False)
-        tx_indices = jax.random.choice(seed,self.scan.n_tx,(self.n_tx_samples,),replace=False)
-
-        ax_indices = jax.numpy.sort(ax_indices)
-        el_indices = jax.numpy.sort(el_indices)
-        tx_indices = jax.numpy.sort(tx_indices)
-
-        rf_data = sim_jax(
-            ax_indices = ax_indices,
-            el_indices = el_indices,
-            tx_indices = tx_indices,
-            scatterer_positions = self.positions[...,[0,2]],
-            scatterer_amplitudes = magnitudes,
-            t0_delays = jnp.array(self.scan.t0_delays),
-            probe_geometry = jnp.array(self.scan.probe_geometry[...,[0,2]]),
-            element_angles = jnp.zeros(self.scan.n_el),
-            tx_apodizations = jnp.array(self.scan.tx_apodizations),
-            initial_times = jnp.array(self.scan.initial_times),
-            element_width_wl = jnp.array(self.scan.element_width/self.scan.wavelength),
-            carrier_frequency = self.scan.center_frequency,
-            sampling_frequency = self.scan.sampling_frequency,
-            wavefront_only=self.wavefront_only,
-            waveform_samples = None,
-            **kwargs
-        )
-        return (rf_data, tx_indices, ax_indices, el_indices)
-    
-    def transpose(self):
-        raise NotImplementedError("Transpose for SimulateOperatorJaxus is not implemented.")
-
-    def __str__(self):
-        return f"SimulateOperator implemented in jax"
-
-
 class SimulatorPartialFFT(Operator):
     def __init__(self, scan, 
                  n_tx_samples = 5, 
                  n_freq_samples = 10, 
                  n_el_samples = 10, 
                  scatterer_chunk_size = 32, 
-                 n_scat_per_it = 10000):
+                 n_scat_per_it = None):
         super().__init__()
         self.scan = scan
         self.shape = self.scan.grid.shape[:2]
         self.n_el_samples = n_el_samples
-        self.n_freqs = 2**(jnp.ceil(jnp.log2(self.scan.n_ax))) // 2 + 1
+        self.n_freqs = 2**int(ops.ceil(ops.log2(self.scan.n_ax))) // 2 + 1
         self.n_freq_samples = n_freq_samples
         self.n_tx_samples = n_tx_samples
-        self.positions = jnp.reshape(self.scan.grid, (-1, 3))
+        self.positions = ops.reshape(self.scan.grid, (-1, 3))
         self.scatterer_chunk_size = scatterer_chunk_size
-        self.n_scat_per_it = n_scat_per_it
+        if n_scat_per_it is None:
+            self.n_scat_per_it = int(self.scan.grid.shape[0] * self.scan.grid.shape[1])
+        else:
+            self.n_scat_per_it = int(n_scat_per_it)
     
     def img_to_magnitude(self,image):
         image = translate(image, range_from = (-1,1), range_to=self.scan.dynamic_range)
@@ -376,14 +232,16 @@ class SimulatorPartialFFT(Operator):
     
     def sample_indices(self, seed):
         n_scat = len(self.positions)
-        indices = jax.random.choice(seed, n_scat, (self.n_scat_per_it,), replace=False)
-        indices = jnp.sort(indices)
+        # Uniform sampling without replacement using random sort trick
+        random_vals = keras.random.uniform(shape=(n_scat,), seed=seed)
+        indices = ops.argsort(random_vals)[:self.n_scat_per_it]
+        indices = ops.sort(indices)
         return indices
     
     def forward(self,image, seed):
         assert len(image.shape)==4, f"Image should be of shape [n_frames, H, W, 1] but got {image.shape}"
-        image = ops.image.resize(image, self.shape) #Can I simply upscale the image? 
-        scat_seed, el_seed, tx_seed, freq_seed = jax.random.split(seed, 4)   
+        image = ops.image.resize(image, self.shape)
+        scat_seed, el_seed, tx_seed, freq_seed = split_seed(seed, 4)   
 
         n_frames, *img_shape = image.shape
         magnitudes = self.img_to_magnitude(image)
@@ -394,20 +252,30 @@ class SimulatorPartialFFT(Operator):
         positions = ops.take(self.positions, scat_indices, axis=0)
         magnitudes = ops.take(magnitudes, scat_indices, axis=1)
         
-        el_indices = jax.random.choice(el_seed, self.scan.n_el, (self.n_el_samples,), replace=False)
-        tx_indices = jax.random.choice(tx_seed, self.scan.n_tx, (self.n_tx_samples,), replace=False)
+        # Uniform sampling without replacement for elements and transmits
+        el_random = keras.random.uniform(shape=(self.scan.n_el,), seed=el_seed)
+        el_indices = ops.argsort(el_random)[:self.n_el_samples]
+        el_indices = ops.sort(el_indices)
+        
+        tx_random = keras.random.uniform(shape=(self.scan.n_tx,), seed=tx_seed)
+        tx_indices = ops.argsort(tx_random)[:self.n_tx_samples]
+        tx_indices = ops.sort(tx_indices)
 
         # Sample frequencies with Gaussian weighting centered at carrier frequency
-        freq_bins = jnp.arange(self.n_freqs, dtype=jnp.float32)
+        freq_bins = ops.arange(self.n_freqs, dtype='float32')
         std_bins = self.n_freqs // 8
-        probs = jnp.exp(-0.5 * ((freq_bins - self.n_freqs/2) / std_bins) ** 2)
+        probs = ops.exp(-0.5 * ((freq_bins - self.n_freqs/2) / std_bins) ** 2)
         probs = probs / probs.sum()
         
-        freq_indices = jax.random.choice(freq_seed, self.n_freqs, (self.n_freq_samples,),replace=False)
+        log_probs = ops.log(ops.maximum(probs, 1e-10))  # Avoid log(0)
+        gumbel = -ops.log(-ops.log(keras.random.uniform(shape=(self.n_freqs,), seed=freq_seed)) + 1e-10)
+        freq_indices = ops.argsort(-(log_probs + gumbel))[:self.n_freq_samples]
+        freq_indices = ops.sort(freq_indices)
+        # freq_indices = jax.random.choice(freq_seed, self.n_freqs, (self.n_freq_samples,),replace=False, p=probs)
         
-        el_indices = jax.numpy.sort(el_indices)
-        freq_indices = jax.numpy.sort(freq_indices)
-        tx_indices = jax.numpy.sort(tx_indices)
+        el_indices = ops.sort(el_indices)
+        freq_indices = ops.sort(freq_indices)
+        tx_indices = ops.sort(tx_indices)
         
         # Compute scatterer padding for chunking
         n_scat = positions.shape[0]
@@ -470,11 +338,10 @@ class SimulatorPartialFFT(Operator):
         # Outer scan: xs = magnitudes (n_frames, n_scat); outputs stacked -> (n_frames, ...)
         _, rf_data = ops.scan(process_frame, None, magnitudes)
         
-        return rf_data, tx_indices, freq_indices, el_indices
+        return 10000*rf_data, tx_indices, freq_indices, el_indices
     
     def transpose(self):
-        raise NotImplementedError("Transpose for SimulateOperatorJaxus is not implemented.")
+        raise NotImplementedError("The transpose of the simulator operator is not implemented.")
 
     def __str__(self):
-        return f"SimulateOperator implemented in jax"
-
+        return f"y = A*x where A is simulator in the fourier domain. Only returns a subset of the indices."

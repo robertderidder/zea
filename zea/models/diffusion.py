@@ -22,8 +22,6 @@ from typing import Literal
 
 import keras
 from keras import ops
-import jax.numpy as jnp
-import jax
 
 from zea.backend import _import_tf, jit
 from zea.backend.autograd import AutoGrad
@@ -40,7 +38,6 @@ from zea.models.unet import get_time_conditional_unetwork
 from zea.models.utils import LossTrackerWrapper
 
 tf = _import_tf()
-
 
 @model_registry(name="diffusion")
 class DiffusionModel(DeepGenerativeModel):
@@ -931,20 +928,19 @@ class DPS_SIM(DiffusionGuidance):
         # https://github.com/DPS2022/diffusion-posterior-sampling/blob/effbde7325b22ce8dc3e2c06c160c021e743a12d/guided_diffusion/condition_methods.py#L31  # noqa: E501
         rf_data, tx_indices, freq_indices, el_indices= self.operator.forward(pred_images, seed, **kwargs)
 
-        grid_idx = jnp.ix_(
-        jnp.arange(measurements.shape[0]), # Batch dim
-        tx_indices,                        # Transmit/Frame dimd
-        freq_indices,                      # Frequency indices or axial indices
-        el_indices,                        # Element indices
-        jnp.arange(measurements.shape[4])  # Last dim (e.g. Channel)
-        )       
+        # Select the sampled measurement subspace axis-by-axis using backend-agnostic ops.
+        sampled_measurements = ops.take(measurements, tx_indices, axis=1)
+        sampled_measurements = ops.take(sampled_measurements, freq_indices, axis=2)
+        sampled_measurements = ops.take(sampled_measurements, el_indices, axis=3)
+        n_samples = ops.prod(rf_data.shape) 
 
         # Split complex difference into real and imaginary parts for autograd
-        diff = measurements[grid_idx] - rf_data
+        diff = sampled_measurements - rf_data
         diff_real = ops.real(diff)
         diff_imag = ops.imag(diff)
+        
         # Compute L2 norm on real-valued tensors
-        measurement_error = ops.sqrt(ops.sum(diff_real**2 + diff_imag**2))
+        measurement_error = ops.sqrt(ops.sum(diff_real**2 + diff_imag**2))/n_samples
 
         # y = ops.abs(measurements[grid_idx])
         # Ax = ops.abs(rf_data)
