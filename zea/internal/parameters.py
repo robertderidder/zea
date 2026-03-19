@@ -30,16 +30,32 @@ def cache_with_dependencies(*deps):
             self._assert_dependencies_met(func.__name__)
 
             if func.__name__ in self._cache:
-                # Check if dependencies changed for mutable parameters
-                current_hash = self._current_dependency_hash(func.__name__)
-                if current_hash == self._dependency_versions.get(func.__name__):
-                    return self._cache[func.__name__]
-                else:
+                # Check if dependencies changed for mutable parameters. If
+                # computing the dependency hash fails (e.g. due to
+                # non-picklable local objects), invalidate the cache and
+                # proceed to recompute.
+                try:
+                    current_hash = self._current_dependency_hash(func.__name__)
+                except Exception:
                     self._invalidate(func.__name__)
+                else:
+                    if current_hash == self._dependency_versions.get(func.__name__):
+                        return self._cache[func.__name__]
+                    else:
+                        self._invalidate(func.__name__)
 
             result = func(self)
             self._cache[func.__name__] = result
-            self._dependency_versions[func.__name__] = self._current_dependency_hash(func.__name__)
+            # Attempt to compute and store a dependency hash version. If
+            # hashing fails (e.g. objects that cannot be pickled), store
+            # None so that future checks will conservatively treat the
+            # dependency as changed.
+            try:
+                self._dependency_versions[func.__name__] = (
+                    self._current_dependency_hash(func.__name__)
+                )
+            except Exception:
+                self._dependency_versions[func.__name__] = None
             return result
 
         return property(wrapper)
@@ -159,7 +175,9 @@ class Parameters(ZeaObject):
 
         # Check if VALID_PARAMS is defined
         if self.VALID_PARAMS is None:
-            raise NotImplementedError("VALID_PARAMS must be defined in subclasses of Parameters.")
+            raise NotImplementedError(
+                "VALID_PARAMS must be defined in subclasses of Parameters."
+            )
 
         # Check if the definition of the class has circular dependencies
         for name in self.__class__.__dict__:
@@ -199,11 +217,19 @@ class Parameters(ZeaObject):
 
         # Cast the value if needed and possible
         expected_type = cls.VALID_PARAMS[key]["type"]
-        if expected_type is not None and value is not None and not isinstance(value, expected_type):
+        if (
+            expected_type is not None
+            and value is not None
+            and not isinstance(value, expected_type)
+        ):
             value = cls._cast(key, value)
 
         # Check again
-        if expected_type is not None and value is not None and not isinstance(value, expected_type):
+        if (
+            expected_type is not None
+            and value is not None
+            and not isinstance(value, expected_type)
+        ):
             allowed = cls._human_readable_type(expected_type)
             raise TypeError(
                 f"Parameter '{key}' expected type {allowed}, got {type(value).__name__}"
@@ -218,7 +244,9 @@ class Parameters(ZeaObject):
         Additionally, int to float conversion is allowed implicitly."""
         # If the value is a single-element array, convert it to a scalar
         # If it's a numpy scalar, convert it to a native Python type
-        if (isinstance(value, np.ndarray) and value.size == 1) or isinstance(value, np.generic):
+        if (isinstance(value, np.ndarray) and value.size == 1) or isinstance(
+            value, np.generic
+        ):
             value = value.item()
 
         # Assume the key exists in VALID_PARAMS
@@ -229,7 +257,9 @@ class Parameters(ZeaObject):
 
         cast_to = config["type"]
         if isinstance(cast_to, tuple):
-            raise ValueError(f"Casting to multiple types is not supported for parameter '{key}'.")
+            raise ValueError(
+                f"Casting to multiple types is not supported for parameter '{key}'."
+            )
 
         if "cast_from" not in config:
             if isinstance(value, int) and cast_to is float:
@@ -250,7 +280,9 @@ class Parameters(ZeaObject):
     def _human_readable_type(type):
         """Convert a type or tuple of types to a human-readable string."""
         return (
-            type.__name__ if not isinstance(type, tuple) else ", ".join([t.__name__ for t in type])
+            type.__name__
+            if not isinstance(type, tuple)
+            else ", ".join([t.__name__ for t in type])
         )
 
     def copy(self):
@@ -317,8 +349,19 @@ class Parameters(ZeaObject):
         if self._has_param(item):
             return self._params[item]
 
+        # If a class-level property exists (e.g. a computed property),
+        # call its descriptor to compute and return the value. This
+        # provides a safe fallback in cases where normal attribute
+        # lookup didn't resolve the property but the descriptor is
+        # still present on the class.
+        cls_attr = getattr(self.__class__, item, None)
+        if isinstance(cls_attr, property):
+            return cls_attr.__get__(self, self.__class__)
+
         # Attribute not found
-        raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{item}'")
+        raise AttributeError(
+            f"'{self.__class__.__name__}' object has no attribute '{item}'"
+        )
 
     def __setattr__(self, key, value):
         # Give clear error message on assignment to methods
@@ -372,7 +415,9 @@ class Parameters(ZeaObject):
                 if old_exists and old_val is None and new_val is None:
                     continue
                 if old_exists and old_val is not None and new_val is not None:
-                    if isinstance(old_val, np.ndarray) and isinstance(new_val, np.ndarray):
+                    if isinstance(old_val, np.ndarray) and isinstance(
+                        new_val, np.ndarray
+                    ):
                         try:
                             if np.array_equal(old_val, new_val):
                                 continue
@@ -405,7 +450,9 @@ class Parameters(ZeaObject):
         elif name in self.VALID_PARAMS:
             raise ValueError(f"Cannot delete parameter '{name}' because it is not set.")
         else:
-            raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
+            raise AttributeError(
+                f"'{self.__class__.__name__}' object has no attribute '{name}'"
+            )
 
     @classmethod
     def _check_for_circular_dependencies(cls, name, seen=None):
@@ -502,12 +549,20 @@ class Parameters(ZeaObject):
     @classmethod
     def get_properties(cls):
         """Get all properties of the class, including those with dependencies."""
-        return [name for name, value in inspect.getmembers(cls) if isinstance(value, property)]
+        return [
+            name
+            for name, value in inspect.getmembers(cls)
+            if isinstance(value, property)
+        ]
 
     @classmethod
     def get_properties_with_dependencies(cls):
         """Get all properties of the class that have dependencies."""
-        return [name for name in cls.get_properties() if cls._is_property_with_dependencies(name)]
+        return [
+            name
+            for name in cls.get_properties()
+            if cls._is_property_with_dependencies(name)
+        ]
 
     def to_tensor(self, include=None, exclude=None, keep_as_is: list = None):
         """
