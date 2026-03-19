@@ -222,6 +222,8 @@ class H5DataSource:
         overlapping_blocks: Allow overlapping frame blocks.
         limit_n_samples: Cap the number of samples.
         limit_n_frames: Cap frames loaded per file.
+        return_filename: Return filename metadata with each sample.
+        cache: Cache loaded samples to RAM.
         validate: Validate dataset against the zea format.
     """
 
