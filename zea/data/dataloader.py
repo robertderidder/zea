@@ -412,7 +412,7 @@ class Dataloader:
         normalization_range: Target value range, e.g. ``(0, 1)``.
         clip_image_range: Clip values to ``image_range`` before normalizing.
         assert_image_range: Assert that data is within ``image_range``.
-        dataset_repetitions: Repeat dataset N times (``None`` = infinite).
+        dataset_repetitions: Repeat dataset N times. Default is ``None`` which means no repetition.
         cache: Cache loaded samples to RAM.
         additional_axes_iter: Extra axes to iterate over.
         sort_files: Sort files numerically.

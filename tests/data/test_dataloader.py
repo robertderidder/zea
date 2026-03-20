@@ -448,7 +448,7 @@ def test_random_circle_inclusion_augmentation(dummy_hdf5):
     )
 
     images = next(iter(dataset))
-    images_np = np.array(images)
+    images_np = ops.convert_to_numpy(images)
 
     # Output shape should match input shape
     assert images_np.shape == (
@@ -483,7 +483,7 @@ def test_resize_with_different_shapes(multi_shape_dataset):
 
     # Get the first batch
     images = next(iter(dataset))
-    images_np = np.array(images)
+    images_np = ops.convert_to_numpy(images)
 
     # Output shape should match input shape
     assert images_np.shape[-3:-1] == (
