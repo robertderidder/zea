@@ -99,4 +99,5 @@ from . import (
     taesd,
     unet,
     utils,
+    flow,
 )
