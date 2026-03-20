@@ -34,7 +34,7 @@ from zea import log
 from zea.data.datasets import Dataset, H5FileHandleCache, count_samples_per_directory
 from zea.data.file import File
 from zea.data.layers import Resizer
-from zea.utils import map_negative_indices
+from zea.utils import canonicalize_axis, map_negative_indices
 
 DEFAULT_NORMALIZATION_RANGE = (0, 1)
 
@@ -229,8 +229,6 @@ class H5DataSource:
         self.frame_index_stride = int(frame_index_stride)
         self.frame_axis = int(frame_axis)
         self.insert_frame_axis = insert_frame_axis
-        self.initial_frame_axis = int(initial_frame_axis)
-        self.additional_axes_iter = list(additional_axes_iter or [])
 
         assert self.frame_index_stride > 0, (
             f"`frame_index_stride` must be > 0, got {self.frame_index_stride}"
@@ -242,6 +240,10 @@ class H5DataSource:
         self.file_paths = _dataset.file_paths
         self.file_shapes = _dataset.load_file_shapes(key)
         _dataset.close()
+
+        num_dims = len(self.file_shapes[0])
+        self.initial_frame_axis = canonicalize_axis(int(initial_frame_axis), num_dims)
+        self.additional_axes_iter = map_negative_indices(list(additional_axes_iter or []), num_dims)
 
         # Compute per-sample index table
         self.indices = generate_h5_indices(
@@ -261,27 +263,10 @@ class H5DataSource:
             log.info(f"H5DataSource: Limiting to {limit_n_samples} / {len(self.indices)} samples.")
             self.indices = self.indices[:limit_n_samples]
 
-        # Compute output shape
-        image_shapes = np.array(self.file_shapes)
-        image_shapes = np.delete(
-            image_shapes, (self.initial_frame_axis, *self.additional_axes_iter), axis=1
-        )
-        n_dims = len(image_shapes[0])
-        equal = np.all(image_shapes == image_shapes[0])
-        self.shape = np.array(image_shapes[0] if equal else [None] * n_dims)
-
-        if insert_frame_axis:
-            _fa = map_negative_indices([frame_axis], len(self.shape) + 1)
-            self.shape = np.insert(self.shape, _fa, 1)
-        if self.shape[frame_axis]:
-            self.shape[frame_axis] = self.shape[frame_axis] * n_frames
-
         # Thread-local file handle caches (one per thread)
         self._local = threading.local()
         self._all_caches: set[H5FileHandleCache] = set()
         self._all_caches_lock = threading.Lock()
-
-    # -- grain.RandomAccessDataSource protocol ---------------------------------
 
     def __len__(self) -> int:
         return len(self.indices)
@@ -315,8 +300,6 @@ class H5DataSource:
         return (
             f"H5DataSource(n_samples={len(self)}, n_files={len(self.file_paths)}, key='{self.key}')"
         )
-
-    # -- internals -------------------------------------------------------------
 
     def _get_file_handle_cache(self) -> H5FileHandleCache:
         """Return the file-handle cache for the current thread."""
@@ -631,7 +614,6 @@ class Dataloader:
             f"<Dataloader: {len(self.source)} samples, "
             f"batch_size={self.batch_size}, "
             f"key='{self.source.key}', "
-            f"shape={tuple(self.source.shape)}, "
             f"threads={self.num_threads}>"
         )
 
