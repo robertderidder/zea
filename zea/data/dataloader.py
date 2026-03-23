@@ -32,7 +32,6 @@ import numpy as np
 
 from zea import log
 from zea.data.datasets import Dataset, H5FileHandleCache, count_samples_per_directory
-from zea.data.file import File
 from zea.data.layers import Resizer
 from zea.utils import canonicalize_axis, map_negative_indices
 
@@ -93,8 +92,10 @@ def generate_h5_indices(
                 ...,
             ]
     """
-    if not limit_n_frames:
+    if limit_n_frames is None:
         limit_n_frames = np.inf
+    else:
+        assert limit_n_frames > 0, f"limit_n_frames must be > 0, got {limit_n_frames}"
 
     assert len(file_paths) == len(file_shapes), "file_paths and file_shapes must have same length"
 
@@ -279,17 +280,32 @@ class H5DataSource:
         file_name, key, indices = self.indices[index]
         file_handle_cache = self._get_file_handle_cache()
         file = file_handle_cache.get_file(file_name)
-        image = self._load(file, key, indices)
+
+        try:
+            images = file.load_data(key, indices)
+        except (OSError, IOError):
+            # Invalidate cache entry and retry once
+            file_handle_cache.pop(file_name)
+            file = file_handle_cache.get_file(file_name)
+            images = file.load_data(key, indices)
+
+        if self.insert_frame_axis:
+            initial = self.initial_frame_axis
+            if self.additional_axes_iter:
+                initial -= sum(ax < self.initial_frame_axis for ax in self.additional_axes_iter)
+            images = np.moveaxis(images, initial, self.frame_axis)
+        else:
+            images = np.concatenate(images, axis=self.frame_axis)
 
         if self.return_filename:
             file_data = {
-                "fullpath": file.filename,
-                "filename": Path(file_name).stem,
+                "fullpath": file.path,
+                "filename": file.stem,
                 "indices": indices,
             }
-            result = (image, file_data)
+            result = (images, file_data)
         else:
-            result = image
+            result = images
 
         if self.cache:
             self._data_cache[index] = result
@@ -308,28 +324,6 @@ class H5DataSource:
             with self._all_caches_lock:
                 self._all_caches.add(self._local.cache)
         return self._local.cache
-
-    def _load(self, file: File, key: str, indices):
-        """Read from an open HDF5 file and handle frame-axis logic."""
-        try:
-            images = file.load_data(key, indices)
-        except (OSError, IOError):
-            # Invalidate cache entry and retry once
-            fname = file.filename
-            file_handle_cache = self._get_file_handle_cache()
-            file_handle_cache.pop(fname)
-            file = file_handle_cache.get_file(fname)
-            images = file.load_data(key, indices)
-
-        if self.insert_frame_axis:
-            initial = self.initial_frame_axis
-            if self.additional_axes_iter:
-                initial -= sum(ax < self.initial_frame_axis for ax in self.additional_axes_iter)
-            images = np.moveaxis(images, initial, self.frame_axis)
-        else:
-            images = np.concatenate(images, axis=self.frame_axis)
-
-        return images
 
     def close(self):
         """Close all file handles across all threads."""
