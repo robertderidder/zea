@@ -3,7 +3,7 @@
 Example:
     .. code-block:: python
 
-        from zea.data.dataloader import Dataloader
+        from zea import Dataloader
 
         loader = Dataloader(
             file_paths="/path/to/dataset",
