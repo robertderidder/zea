@@ -240,7 +240,7 @@ class Simulator(Operator):
         indices = ops.sort(indices)
         return indices
     
-    def forward(self,image, seed):
+    def forward(self,image, seed, **kwargs):
         assert len(image.shape)==4, f"Image should be of shape [n_frames, H, W, 1] but got {image.shape}"
         image = ops.image.resize(image, (self.scan.grid_size_x, self.scan.grid_size_z))
         scat_seed, el_seed, tx_seed, freq_seed = split_seed(seed, 4)   
