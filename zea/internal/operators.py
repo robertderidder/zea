@@ -16,7 +16,6 @@ from zea.internal.core import Object
 from zea.internal.registry import operator_registry
 from zea.func import translate
 from zea.func.tensor import split_seed
-
 from zea.simulator_zea_partial import simulate_rf
 
 class Operator(abc.ABC, Object):
@@ -243,7 +242,7 @@ class Simulator(Operator):
     
     def forward(self,image, seed):
         assert len(image.shape)==4, f"Image should be of shape [n_frames, H, W, 1] but got {image.shape}"
-        image = ops.image.resize(image, self.shape)
+        image = ops.image.resize(image, (self.scan.grid_size_x, self.scan.grid_size_z))
         scat_seed, el_seed, tx_seed, freq_seed = split_seed(seed, 4)   
 
         n_frames, *img_shape = image.shape
@@ -353,9 +352,9 @@ class Simulator(Operator):
 class Simulator_Experimental(Operator):
     """
     Experimental version of simulator operator. Extra features include:
-        - Option to add jitter to scatterer positions to break symmetries and make the problem more realistic.
+        - Option to add jitter to scatterer positions to break symmetries and make the problem more realistic. Choose from 0 (no jitter), 1 (jitter once at start) or 2 (jitter at each iteration). 
         - Option to sample scatterers based on intensity of the input image, rather than uniformly at random. 
-          This can be used to simulate a more realistic scenario where scatterers in high-intensity regions
+          This can be used to simulate a more realistic scenario where scatterer points are in in high-intensity regions
     """
     def __init__(self, scan, 
                  n_tx_samples = 5, 
@@ -363,8 +362,9 @@ class Simulator_Experimental(Operator):
                  n_el_samples = 10, 
                  scatterer_chunk_size = 256, 
                  n_scat_per_it = None,
-                 add_jitter = False,
-                 sample_by_intensity = False,):
+                 add_jitter = 0,
+                 sample_by_intensity = False,
+                 jitter_scale = 0.1,):
         super().__init__()
         self.scan = scan
         self.shape = self.scan.grid.shape[:2]
@@ -372,14 +372,30 @@ class Simulator_Experimental(Operator):
         self.n_freqs = 2**int(ops.ceil(ops.log2(self.scan.n_ax))) // 2 + 1
         self.n_freq_samples = n_freq_samples
         self.n_tx_samples = n_tx_samples
-        self.positions = ops.reshape(self.scan.grid, (-1, 3))
+        self.positions = self.scan.flatgrid
         self.add_jitter = add_jitter
         self.sample_by_intensity = sample_by_intensity
         self.scatterer_chunk_size = scatterer_chunk_size
+        self.extent = self.scan.extent
+        self.jitter_scale = jitter_scale
         if n_scat_per_it is None:
             self.n_scat_per_it = int(self.scan.grid.shape[0] * self.scan.grid.shape[1])
         else:
             self.n_scat_per_it = int(n_scat_per_it)
+
+        if self.add_jitter == 1:
+            # Add jitter once at the start
+            dx = (self.positions[...,0].max() - self.positions[...,0].min())/self.shape[0]
+            dz = (self.positions[...,2].max() - self.positions[...,2].min())/self.shape[1]
+            
+            jitter_scale_x = self.jitter_scale*dx  # Adjust as needed
+            jitter_scale_z = self.jitter_scale*dz  # Adjust as needed
+            jit_x_seed, jit_z_seed = split_seed(jax.random.key(0), 2)
+            jitter_x = keras.random.normal(shape=(self.positions.shape[0],), seed=jit_x_seed) * jitter_scale_x
+            jitter_z = keras.random.normal(shape=(self.positions.shape[0],), seed=jit_z_seed) * jitter_scale_z
+            jitter = ops.stack([jitter_x, ops.zeros_like(jitter_x), jitter_z], axis=1)
+            self.positions = self.positions + jitter
+    
     
     def img_to_magnitude(self,image, n_frames):
         image = translate(image, range_from = (-1,1), range_to=self.scan.dynamic_range)
@@ -390,7 +406,7 @@ class Simulator_Experimental(Operator):
         image_lin = mask * image_lin
         return image_lin
     
-    def sample_by_intensity(self, magnitudes, progress, seed):
+    def sample_indices_by_intensity(self, magnitudes, seed, progress):
         #probability distribution is uniform at progress = 0, and becomes more and more weighted towards high intensity regions as progress approaches 1.
         n_scat = len(self.positions)
         intensity = ops.mean(magnitudes, axis=0) # (n_scat,)
@@ -402,6 +418,7 @@ class Simulator_Experimental(Operator):
         probs_uniform = ops.ones_like(probs_intensity) / n_scat
 
         #Interpolate between uniform and intensity-based sampling based on progress
+        #TODO: test if a sinuoidal schedule for progress improves results compared to linear
         probs = (1-progress)*probs_uniform + progress*probs_intensity
 
         #Apply Gumbel-max trick for sampling without replacement according to probs
@@ -411,34 +428,40 @@ class Simulator_Experimental(Operator):
         indices = ops.sort(indices)
         return indices
 
-    def sample_indices(self, magnitudes, seed, sample_by_intensity, progress):
-        #progress is float between 0 and 1, indicting how far long the diffusion process we are.
+    def sample_indices(self, magnitudes, seed, sample_by_intensity, **kwargs):
+        #progress is float between 0 and 1, indicating how far long the diffusion process we are.
         n_scat = len(self.positions)
         if not sample_by_intensity: # Uniform sampling without replacement using random sort trick
             random_vals = keras.random.uniform(shape=(n_scat,), seed=seed)
             indices = ops.argsort(random_vals)[:self.n_scat_per_it]
             indices = ops.sort(indices)
         if sample_by_intensity: # Sample based on intensity of input image, more weighting as progress goes toward 1.
-            indices = self.sample_by_intensity(magnitudes, progress, seed)
+            indices = self.sample_indices_by_intensity(magnitudes, seed, **kwargs)
         return indices
     
-    def forward(self,image, seed, progress):
+    def forward(self, image, seed, **kwargs):
         assert len(image.shape)==4, f"Image should be of shape [n_frames, H, W, 1] but got {image.shape}"
         image = ops.image.resize(image, self.shape)
-        scat_seed, el_seed, tx_seed, freq_seed = split_seed(seed, 4)   
+        scat_seed, el_seed, tx_seed, freq_seed, jit_x_seed, jit_z_seed = split_seed(seed, 6)   
 
         n_frames, *img_shape = image.shape
         magnitudes = self.img_to_magnitude(image, n_frames)
 
-        scat_indices = self.sample_indices(magnitudes, scat_seed, sample_by_intensity=self.sample_by_intensity, progress=progress)
+        scat_indices = self.sample_indices(magnitudes, scat_seed, sample_by_intensity=self.sample_by_intensity, **kwargs)
 
         positions = ops.take(self.positions, scat_indices, axis=0)
         magnitudes = ops.take(magnitudes, scat_indices, axis=1)
 
-        if self.add_jitter:
+        if self.add_jitter == 2: # Add jitter at each iteration
+            dx = (self.positions[...,0].max() - self.positions[...,0].min())/self.shape[0]
+            dz = (self.positions[...,2].max() - self.positions[...,2].min())/self.shape[1]
+            
             # Add small jitter to positions to break symmetries and make the problem more realistic
-            jitter_scale = 0.1  # Adjust as needed
-            jitter = keras.random.normal(shape=positions.shape, seed=scat_seed) * jitter_scale
+            jitter_scale_x = self.jitter_scale*dx  # Adjust as needed
+            jitter_scale_z = self.jitter_scale*dz  # Adjust as needed
+            jitter_x = keras.random.normal(shape=(positions.shape[0],), seed=jit_x_seed) * jitter_scale_x
+            jitter_z = keras.random.normal(shape=(positions.shape[0],), seed=jit_z_seed) * jitter_scale_z
+            jitter = ops.stack([jitter_x, ops.zeros_like(jitter_x), jitter_z], axis=1)
             positions = positions + jitter
 
         # Uniform sampling without replacement for elements and transmits
@@ -461,7 +484,6 @@ class Simulator_Experimental(Operator):
         gumbel = -ops.log(-ops.log(keras.random.uniform(shape=(self.n_freqs,), seed=freq_seed)) + 1e-10)
         freq_indices = ops.argsort(-(log_probs + gumbel))[:self.n_freq_samples]
         freq_indices = ops.sort(freq_indices)
-        # freq_indices = jax.random.choice(freq_seed, self.n_freqs, (self.n_freq_samples,),replace=False, p=probs)
         
         el_indices = ops.sort(el_indices)
         freq_indices = ops.sort(freq_indices)

@@ -687,6 +687,7 @@ class DiffusionModel(DeepGenerativeModel):
                 measurements=measurements,
                 noise_rates=noise_rates,
                 signal_rates=signal_rates,
+                progress = step*step_size,
                 **kwargs,
             )
 
@@ -964,7 +965,6 @@ class DPS_SIM(DiffusionGuidance):
             Tuple of (gradients, (measurement_error, (pred_noises, pred_images)))
         """
         return self.gradient_fn(noisy_images, **kwargs)
-
 
 @diffusion_guidance_registry(name="dps")
 class DPS(DiffusionGuidance):
