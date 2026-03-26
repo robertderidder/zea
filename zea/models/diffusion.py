@@ -942,10 +942,6 @@ class DPS_SIM(DiffusionGuidance):
         
         # Compute L2 norm on real-valued tensors
         measurement_error = ops.sqrt(ops.sum(diff_real**2 + diff_imag**2))/n_samples
-
-        # y = ops.abs(measurements[grid_idx])
-        # Ax = ops.abs(rf_data)
-        # measurement_error = L2(y - Ax)
  
         return measurement_error, (pred_noises, pred_images)
 
