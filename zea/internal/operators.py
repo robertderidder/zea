@@ -340,7 +340,7 @@ class Simulator(Operator):
         # Outer scan: xs = magnitudes (n_frames, n_scat); outputs stacked -> (n_frames, ...)
         _, rf_data = ops.scan(process_frame, None, magnitudes)
         
-        return 10000*rf_data, tx_indices, freq_indices, el_indices
+        return rf_data, tx_indices, freq_indices, el_indices
     
     def transpose(self):
         raise NotImplementedError("The transpose of the simulator operator is not implemented.")
