@@ -22,7 +22,6 @@ from typing import Literal
 
 import keras
 from keras import ops
-
 from zea.backend import _import_tf, jit
 from zea.backend.autograd import AutoGrad
 from zea.func.tensor import L2, fori_loop, split_seed
@@ -651,6 +650,26 @@ class DiffusionModel(DeepGenerativeModel):
             Generated images.
 
         """
+        with_adam = kwargs.pop("with_adam", False)
+        adam_params = kwargs.pop("adam_params", None)
+
+        # Defaults chosen for stable behavior when Adam is enabled.
+        beta1 = 0.9
+        beta2 = 0.999
+        eps = 1e-8
+        m = ops.zeros_like(initial_noise)
+        v = ops.zeros_like(initial_noise)
+
+        if with_adam and adam_params is not None:
+            if isinstance(adam_params, dict):
+                beta1 = adam_params.get("beta1", beta1)
+                beta2 = adam_params.get("beta2", beta2)
+                eps = adam_params.get("eps", eps)
+                m = adam_params.get("m", m)
+                v = adam_params.get("v", v)
+            else:
+                raise ValueError("adam_params must be a dict with keys beta1, beta2, eps, m, v")
+
         num_images, *input_shape = ops.shape(initial_noise)
 
         step_size, progbar = self.prepare_diffusion(
@@ -671,7 +690,9 @@ class DiffusionModel(DeepGenerativeModel):
         )
 
         def step_fn(step, loop_state):
-            noisy_images, pred_images, seed = loop_state
+            noisy_images, pred_images, seed, optimizer_params, gradients = loop_state
+            m, v = optimizer_params
+
             seed, seed1, seed2 = split_seed(seed, 3)
 
             diffusion_times = base_diffusion_times - step * step_size
@@ -691,6 +712,15 @@ class DiffusionModel(DeepGenerativeModel):
                 **kwargs,
             )
 
+            if with_adam:
+                m = beta1 * m + (1 - beta1) * gradients
+                v = beta2 * v + (1 - beta2) * (gradients**2)
+                m_hat = m / (1 - beta1 ** (step + 1))
+                v_hat = v / (1 - beta2 ** (step + 1))
+                grad_update = omega * m_hat / (ops.sqrt(v_hat) + eps)
+            else:
+                grad_update = omega * gradients
+
             next_noisy_images = self.reverse_diffusion_step(
                 shape=(num_images, *input_shape),
                 pred_images=pred_images,
@@ -702,8 +732,8 @@ class DiffusionModel(DeepGenerativeModel):
                 stochastic_sampling=stochastic_sampling,
             )
 
-            next_noisy_images = next_noisy_images - omega * gradients
-            pred_images = pred_images - omega * gradients
+            next_noisy_images = next_noisy_images - grad_update
+            pred_images = pred_images -  grad_update
 
             next_noisy_images = ops.clip(next_noisy_images, self.input_range[0], self.input_range[1])
             pred_images = ops.clip(pred_images, self.input_range[0], self.input_range[1])
@@ -714,11 +744,13 @@ class DiffusionModel(DeepGenerativeModel):
 
             self.store_progress(step, track_progress_type, next_noisy_images, pred_images)
 
-            loop_state = (next_noisy_images, pred_images, seed)
+            loop_state = (next_noisy_images, pred_images, seed, (m, v), gradients)
 
             return loop_state
-
-        _, pred_images, _ = fori_loop(
+        
+        optimizer_params = (m, v)
+        init_gradient = ops.zeros_like(initial_noise)
+        _, pred_images, _, _, _ = fori_loop(
             initial_step,
             diffusion_steps,
             step_fn,
@@ -726,6 +758,8 @@ class DiffusionModel(DeepGenerativeModel):
                 next_noisy_images,
                 ops.zeros_like(initial_noise),
                 seed,
+                optimizer_params,
+                init_gradient,
             ),
             # can't jit this with progbar or tracking intermediate values
             disable_jit=verbose or track_progress_type or disable_jit,
@@ -937,11 +971,9 @@ class DPS_SIM(DiffusionGuidance):
 
         # Split complex difference into real and imaginary parts for autograd
         diff = sampled_measurements - rf_data
-        diff_real = ops.real(diff)
-        diff_imag = ops.imag(diff)
-        
+                
         # Compute L2 norm on real-valued tensors
-        measurement_error = ops.sqrt(ops.sum(diff_real**2 + diff_imag**2))/n_samples
+        measurement_error = L2(diff)
  
         return measurement_error, (pred_noises, pred_images)
 
