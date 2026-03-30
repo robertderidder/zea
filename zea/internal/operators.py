@@ -203,12 +203,29 @@ class FourierBlurOperator(Operator):
         return f"y = F^(-1)(M * F(x)) filter at {self.cutoff_freq}"
 
 class Simulator(Operator):
+    """
+    Simulator operator class. This simulates data given an image (range -1 to 1) and a scan configuration.
+    The operator applies the simulator in the Fourier domain, and only returns a subset of the frequencies, elements and transmits, to speed up the simulation.
+        Formally defined as:
+            y = Ax + n, where A is the simulator in the Fourier domain, and n is the noise.
+        Since the simulator is linear. 
+    """
     def __init__(self, scan, 
                  n_tx_samples = 5, 
-                 n_freq_samples = 10, 
+                 n_freq_samples = 50, 
                  n_el_samples = 10, 
                  scatterer_chunk_size = 256, 
                  n_scat_per_it = None):
+        """
+            Initialize the simulator operator.
+            Args:
+                scan: Scan configuration object containing all scan parameters and geometry.
+                n_tx_samples: Number of transmit events to sample for the simulator.
+                n_freq_samples: Number of frequency bins to sample for the simulator.
+                n_el_samples: Number of elements to sample for the simulator.
+                scatterer_chunk_size: Number of scatterers to simulate in one chunk. To avoid OOM errors
+                n_scat_per_it: Number of scatterers to sample for each iteration. If None, use all scatterers. Can be used to speed up simulation by only simulating a subset of scatterers at each iteration.
+        """
         super().__init__()
         self.scan = scan
         self.shape = self.scan.grid.shape[:2]
@@ -224,6 +241,14 @@ class Simulator(Operator):
             self.n_scat_per_it = int(n_scat_per_it)
     
     def img_to_magnitude(self,image, n_frames):
+        """
+        Convert input image to scatterer magnitudes for the simulator.
+        This includes:
+            - translating from range (-1, 1) to the scan's dynamic range
+            - converting from dB to linear scale
+            - reshaping to (n_frames, n_scatterers)
+            - setting magnitudes to 0 for scatterers with z<0 (i.e. above the probe), since these should not contribute to the RF signal.
+        """
         image = translate(image, range_from = (-1,1), range_to=self.scan.dynamic_range)
         image_lin = 10**(image/20)
         image_lin = ops.reshape(image_lin, (n_frames, -1))
@@ -233,6 +258,9 @@ class Simulator(Operator):
         return image_lin
     
     def sample_indices(self, seed):
+        """
+        Sample scatter points from the scan grid to speed up simulation.
+        """
         n_scat = len(self.positions)
         # Uniform sampling without replacement using random sort trick
         random_vals = keras.random.uniform(shape=(n_scat,), seed=seed)
@@ -241,6 +269,10 @@ class Simulator(Operator):
         return indices
     
     def forward(self,image, seed, **kwargs):
+        """
+        Simulate RF data from input image using the simulator in the Fourier domain, and return only a subset of the frequencies, elements and transmits.
+        
+        """
         assert len(image.shape)==4, f"Image should be of shape [n_frames, H, W, 1] but got {image.shape}"
         scat_seed, el_seed, tx_seed, freq_seed = split_seed(seed, 4)   
 

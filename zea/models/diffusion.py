@@ -1206,3 +1206,74 @@ class DDS(DiffusionGuidance):
             verbose,
             **op_kwargs,
         )
+    
+@diffusion_guidance_registry(name="dsg")
+class DSG(DiffusionGuidance):
+    """Diffusion with Spherical Gaussian constraint.
+    Reference paper: https://arxiv.org/abs/2402.03201v4
+    Work in progress
+    """
+
+    def setup(self):
+        """Setup the autograd function for DSG."""
+        self.autograd = AutoGrad()
+        self.autograd.set_function(self.compute_error)
+        self.gradient_fn = self.autograd.get_gradient_and_value_jit_fn(
+            has_aux=True,
+            disable_jit=self.disable_jit,
+        )
+
+    def compute_error(
+        self,
+        noisy_images,
+        seed,
+        measurements,
+        noise_rates,
+        signal_rates,
+        **kwargs,
+    ):
+        """
+        Compute measurement error for diffusion posterior sampling.
+
+        Args:
+            noisy_images: Noisy images.
+            measurements: Target measurement.
+            noise_rates: Current noise rates.
+            signal_rates: Current signal rates.
+            omega: Weight for the measurement error.
+            **kwargs: Additional arguments for the operator.
+
+        Returns:
+            Tuple of (measurement_error, (pred_noises, pred_images))
+        """
+        pred_noises, pred_images = self.diffusion_model.denoise(
+            noisy_images,
+            noise_rates,
+            signal_rates,
+            training=False,
+        )
+
+        # Note that while the DPS paper specifies a squared L2 here, we follow their
+        # implementation, which uses a standard L2:
+        # https://github.com/DPS2022/diffusion-posterior-sampling/blob/effbde7325b22ce8dc3e2c06c160c021e743a12d/guided_diffusion/condition_methods.py#L31  # noqa: E501
+        measurement_error = L2(measurements - self.operator.forward(pred_images, **kwargs))
+
+        return measurement_error, (pred_noises, pred_images)
+
+    def __call__(self, noisy_images, **kwargs):
+        """
+        Call the gradient function.
+
+        Args:
+            noisy_images: Noisy images.
+            measurement: Target measurement.
+            operator: Forward operator.
+            noise_rates: Current noise rates.
+            signal_rates: Current signal rates.
+            omega: Weight for the measurement error.
+            **kwargs: Additional arguments for the operator.
+
+        Returns:
+            Tuple of (gradients, (measurement_error, (pred_noises, pred_images)))
+        """
+        return self.gradient_fn(noisy_images, **kwargs)
