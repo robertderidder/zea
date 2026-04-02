@@ -21,6 +21,7 @@ import abc
 from typing import Literal
 
 import keras
+import jax
 from keras import ops
 from zea.backend import _import_tf, jit
 from zea.backend.autograd import AutoGrad
@@ -652,6 +653,8 @@ class DiffusionModel(DeepGenerativeModel):
         """
         with_adam = kwargs.pop("with_adam", False)
         adam_params = kwargs.pop("adam_params", None)
+        optvars = kwargs.pop("optvars", None)
+        omega_optvars = kwargs.pop("omega_optvars", omega)
 
         # Defaults chosen for stable behavior when Adam is enabled.
         beta1 = 0.9
@@ -669,6 +672,19 @@ class DiffusionModel(DeepGenerativeModel):
                 v = adam_params.get("v", v)
             else:
                 raise ValueError("adam_params must be a dict with keys beta1, beta2, eps, m, v")
+
+        if isinstance(self.guidance_fn, DPS_SIM_TOT) and optvars is None:
+            raise ValueError(
+                "DPS_SIM_TOT requires optvars=(position_offset, element_gains, "
+                "sound_speed_offset, initial_time_offset)."
+            )
+
+        if isinstance(self.guidance_fn, DPS_SIM_TOT):
+            optvars = jax.tree_util.tree_map(ops.convert_to_tensor, optvars)
+            opt_m = jax.tree_util.tree_map(ops.zeros_like, optvars)
+            opt_v = jax.tree_util.tree_map(ops.zeros_like, optvars)
+        else:
+            opt_m, opt_v = None, None
 
         num_images, *input_shape = ops.shape(initial_noise)
 
@@ -690,8 +706,9 @@ class DiffusionModel(DeepGenerativeModel):
         )
 
         def step_fn(step, loop_state):
-            noisy_images, pred_images, seed, optimizer_params, gradients = loop_state
+            noisy_images, pred_images, seed, optimizer_params, optvar_state, gradients = loop_state
             m, v = optimizer_params
+            optvars, opt_m, opt_v = optvar_state
 
             seed, seed1, seed2 = split_seed(seed, 3)
 
@@ -702,15 +719,35 @@ class DiffusionModel(DeepGenerativeModel):
             next_diffusion_times = diffusion_times - step_size
             next_noise_rates, next_signal_rates = self.diffusion_schedule(next_diffusion_times)
 
-            gradients, (error, (pred_noises, pred_images)) = self.guidance_fn(
-                noisy_images,
-                seed=seed1,
-                measurements=measurements,
-                noise_rates=noise_rates,
-                signal_rates=signal_rates,
-                progress = step*step_size,
-                **kwargs,
-            )
+            if isinstance(self.guidance_fn, DPS_SIM_TOT):
+                (gradients, optvar_grads), (error, guidance_outputs) = self.guidance_fn(
+                    noisy_images,
+                    optvars,
+                    seed=seed1,
+                    measurements=measurements,
+                    noise_rates=noise_rates,
+                    signal_rates=signal_rates,
+                    progress=step * step_size,
+                    **kwargs,
+                )
+            else:
+                gradients, (error, guidance_outputs) = self.guidance_fn(
+                    noisy_images,
+                    seed=seed1,
+                    measurements=measurements,
+                    noise_rates=noise_rates,
+                    signal_rates=signal_rates,
+                    progress=step * step_size,
+                    **kwargs,
+                )
+                optvar_grads = None
+
+            if not isinstance(guidance_outputs, tuple) or len(guidance_outputs) < 2:
+                raise ValueError(
+                    "Guidance function must return (pred_noises, pred_images) or "
+                    "(pred_noises, pred_images, ...)."
+                )
+            pred_noises, pred_images = guidance_outputs[:2]
 
             if with_adam:
                 m = beta1 * m + (1 - beta1) * gradients
@@ -738,9 +775,45 @@ class DiffusionModel(DeepGenerativeModel):
                 # grad_norm = ops.sqrt(ops.sum(gradients**2, axis=(1,2,3), keepdims=True), + 1e-8)
                 # direction = gradients / grad_norm
                 # guided_noisy_images = noisy_images - omega*noise_rates*direction
-            elif isinstance(self.guidance_fn, (DPS_SIM, DPS)):  
+            elif isinstance(self.guidance_fn, (DPS_SIM, DPS_SIM_TOT, DPS)):
                 next_noisy_images = next_noisy_images - grad_update
                 pred_images = pred_images -  grad_update
+
+                if isinstance(self.guidance_fn, DPS_SIM_TOT) and optvar_grads is not None:
+                    if with_adam:
+                        opt_m = jax.tree_util.tree_map(
+                            lambda mm, g: beta1 * mm + (1 - beta1) * g,
+                            opt_m,
+                            optvar_grads,
+                        )
+                        opt_v = jax.tree_util.tree_map(
+                            lambda vv, g: beta2 * vv + (1 - beta2) * (g**2),
+                            opt_v,
+                            optvar_grads,
+                        )
+                        m_hat_opt = jax.tree_util.tree_map(
+                            lambda mm: mm / (1 - beta1 ** (step + 1)),
+                            opt_m,
+                        )
+                        v_hat_opt = jax.tree_util.tree_map(
+                            lambda vv: vv / (1 - beta2 ** (step + 1)),
+                            opt_v,
+                        )
+                        opt_update = jax.tree_util.tree_map(
+                            lambda mm, vv: omega_optvars * mm / (ops.sqrt(vv) + eps),
+                            m_hat_opt,
+                            v_hat_opt,
+                        )
+                    else:
+                        opt_update = jax.tree_util.tree_map(
+                            lambda g: omega_optvars * g,
+                            optvar_grads,
+                        )
+                    optvars = jax.tree_util.tree_map(
+                        lambda p, u: p - u,
+                        optvars,
+                        opt_update,
+                    )
 
             next_noisy_images = ops.clip(next_noisy_images, self.input_range[0], self.input_range[1])
             pred_images = ops.clip(pred_images, self.input_range[0], self.input_range[1])
@@ -751,13 +824,21 @@ class DiffusionModel(DeepGenerativeModel):
 
             self.store_progress(step, track_progress_type, next_noisy_images, pred_images, gradients)
 
-            loop_state = (next_noisy_images, pred_images, seed, (m, v), gradients)
+            loop_state = (
+                next_noisy_images,
+                pred_images,
+                seed,
+                (m, v),
+                (optvars, opt_m, opt_v),
+                gradients,
+            )
 
             return loop_state
         
         optimizer_params = (m, v)
+        optvar_state = (optvars, opt_m, opt_v)
         init_gradient = ops.zeros_like(initial_noise)
-        _, pred_images, _, _, _ = fori_loop(
+        _, pred_images, _, _, (optvars, _, _), _ = fori_loop(
             initial_step,
             diffusion_steps,
             step_fn,
@@ -766,11 +847,15 @@ class DiffusionModel(DeepGenerativeModel):
                 ops.zeros_like(initial_noise),
                 seed,
                 optimizer_params,
+                optvar_state,
                 init_gradient,
             ),
             # can't jit this with progbar or tracking intermediate values
             disable_jit=verbose or track_progress_type or disable_jit,
         )
+
+        if isinstance(self.guidance_fn, DPS_SIM_TOT):
+            self.last_optvars = optvars
 
         return pred_images
 
@@ -1005,6 +1090,102 @@ class DPS_SIM(DiffusionGuidance):
             Tuple of (gradients, (measurement_error, (pred_noises, pred_images)))
         """
         return self.gradient_fn(noisy_images, **kwargs)
+
+@diffusion_guidance_registry(name="dps_sim_tot")
+class DPS_SIM_TOT(DiffusionGuidance):
+    """Diffusion Posterior Sampling guidance."""
+
+    def setup(self):
+        """Setup gradient function for joint DPS over image and optvars."""
+        if keras.backend.backend() != "jax":
+            raise NotImplementedError("DPS_SIM_TOT currently requires the JAX backend.")
+
+        def _grad_fn(noisy_images, optvars, **kwargs):
+            (error, aux), grads = jax.value_and_grad(
+                self.compute_error,
+                argnums=(0, 1),
+                has_aux=True,
+            )(
+                noisy_images,
+                optvars,
+                **kwargs,
+            )
+            return grads, (error, aux)
+
+        self.gradient_fn = jax.jit(_grad_fn) if not self.disable_jit else _grad_fn
+
+    def compute_error(
+        self,
+        noisy_images,
+        optvars,
+        seed,
+        measurements,
+        noise_rates,
+        signal_rates,
+        **kwargs,
+    ):
+        """
+        Compute measurement error for diffusion posterior sampling.
+
+        Args:
+            noisy_images: Noisy images.
+            measurements: Target measurement.
+            noise_rates: Current noise rates.
+            signal_rates: Current signal rates.
+            omega: Weight for the measurement error.
+            **kwargs: Additional arguments for the operator.
+
+        Returns:
+            Tuple of (measurement_error, (pred_noises, pred_images))
+        """
+        pred_noises, pred_images = self.diffusion_model.denoise(
+            noisy_images,
+            noise_rates,
+            signal_rates,
+            training=False,
+        )
+
+        # Note that while the DPS paper specifies a squared L2 here, we follow their
+        # implementation, which uses a standard L2:
+        # https://github.com/DPS2022/diffusion-posterior-sampling/blob/effbde7325b22ce8dc3e2c06c160c021e743a12d/guided_diffusion/condition_methods.py#L31  # noqa: E501
+        output = self.operator.forward(pred_images, seed, optvars, **kwargs)
+        if not isinstance(output, tuple) or len(output) < 4:
+            raise ValueError(
+                "Simulator_Total.forward must return "
+                "(rf_data, tx_indices, freq_indices, el_indices)."
+            )
+
+        rf_data, tx_indices, freq_indices, el_indices = output[:4]
+
+
+        # Select the sampled measurement subspace axis-by-axis using backend-agnostic ops.
+        sampled_measurements = ops.take(measurements, tx_indices, axis=1)
+        sampled_measurements = ops.take(sampled_measurements, freq_indices, axis=2)
+        sampled_measurements = ops.take(sampled_measurements, el_indices, axis=3)
+        # Split complex difference into real and imaginary parts for autograd
+        diff = sampled_measurements - rf_data
+                
+        # Compute L2 norm on real-valued tensors
+        measurement_error = L2(diff)
+ 
+        return measurement_error, (pred_noises, pred_images)
+
+    def __call__(self, noisy_images, optvars, **kwargs):
+        """
+        Call the gradient function.
+
+        Args:
+            noisy_images: Noisy images.
+            measurement: Target measurement.
+            operator: Forward operator.
+            noise_rates: Current noise rates.
+            signal_rates: Current signal rates.
+            **kwargs: Additional arguments for the operator.
+
+        Returns:
+            Tuple of (gradients, (measurement_error, (pred_noises, pred_images)))
+        """
+        return self.gradient_fn(noisy_images, optvars, **kwargs)
 
 @diffusion_guidance_registry(name="dps")
 class DPS(DiffusionGuidance):
