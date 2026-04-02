@@ -732,8 +732,15 @@ class DiffusionModel(DeepGenerativeModel):
                 stochastic_sampling=stochastic_sampling,
             )
 
-            next_noisy_images = next_noisy_images - grad_update
-            pred_images = pred_images -  grad_update
+            if isinstance(self.guidance_fn, DSG):
+                raise NotImplementedError("DSG guidance not implemented yet")
+                # ##DSG update:
+                # grad_norm = ops.sqrt(ops.sum(gradients**2, axis=(1,2,3), keepdims=True), + 1e-8)
+                # direction = gradients / grad_norm
+                # guided_noisy_images = noisy_images - omega*noise_rates*direction
+            elif isinstance(self.guidance_fn, (DPS_SIM, DPS)):  
+                next_noisy_images = next_noisy_images - grad_update
+                pred_images = pred_images -  grad_update
 
             next_noisy_images = ops.clip(next_noisy_images, self.input_range[0], self.input_range[1])
             pred_images = ops.clip(pred_images, self.input_range[0], self.input_range[1])
@@ -742,7 +749,7 @@ class DiffusionModel(DeepGenerativeModel):
             if verbose:
                 progbar.update(step + 1, [("error", omega*error)])
 
-            self.store_progress(step, track_progress_type, next_noisy_images, pred_images)
+            self.store_progress(step, track_progress_type, next_noisy_images, pred_images, gradients)
 
             loop_state = (next_noisy_images, pred_images, seed, (m, v), gradients)
 
@@ -855,6 +862,7 @@ class DiffusionModel(DeepGenerativeModel):
         track_progress_type,
         next_noisy_images,
         pred_images,
+        gradients=None,
     ):
         """Store the progress of the diffusion process.
 
@@ -863,7 +871,7 @@ class DiffusionModel(DeepGenerativeModel):
             track_progress_type: Type of progress tracking ("x_0" or "x_t").
             next_noisy_images: Noisy images after the current step.
             pred_images: Predicted images.
-
+            gradients: Optional gradients to store.
         Notes:
             - x_0 is considered the predicted image (aka Tweedie estimate)
             - x_t is the noisy intermediate image
@@ -875,9 +883,13 @@ class DiffusionModel(DeepGenerativeModel):
                 self.track_progress.append(ops.convert_to_numpy(pred_images))
             elif track_progress_type == "x_t":
                 self.track_progress.append(ops.convert_to_numpy(next_noisy_images))
+            elif track_progress_type == "gradients":
+                if gradients is not None:
+                    self.track_progress.append(ops.convert_to_numpy(gradients))
+                else:
+                    raise ValueError("Gradients must be provided for tracking when track_progress_type is 'gradients'")
             else:
                 raise ValueError("Invalid track_progress_type")
-
 
 register_presets(diffusion_model_presets, DiffusionModel)
 
