@@ -655,6 +655,7 @@ class DiffusionModel(DeepGenerativeModel):
         adam_params = kwargs.pop("adam_params", None)
         optvars = kwargs.pop("optvars", None)
         omega_optvars = kwargs.pop("omega_optvars", omega)
+        optvars_with_adam = kwargs.pop("optvars_with_adam", with_adam)
 
         # Defaults chosen for stable behavior when Adam is enabled.
         beta1 = 0.9
@@ -675,8 +676,7 @@ class DiffusionModel(DeepGenerativeModel):
 
         if isinstance(self.guidance_fn, DPS_SIM_TOT) and optvars is None:
             raise ValueError(
-                "DPS_SIM_TOT requires optvars=(position_offset, element_gains, "
-                "sound_speed_offset, initial_time_offset)."
+                "DPS_SIM_TOT requires optvars=(position_offset, sound_speed_offset)."
             )
 
         if isinstance(self.guidance_fn, DPS_SIM_TOT):
@@ -720,7 +720,7 @@ class DiffusionModel(DeepGenerativeModel):
             next_noise_rates, next_signal_rates = self.diffusion_schedule(next_diffusion_times)
 
             if isinstance(self.guidance_fn, DPS_SIM_TOT):
-                (gradients, optvar_grads), (error, guidance_outputs) = self.guidance_fn(
+                (gradients, optvar_grads), (error, (pred_noises, pred_images)) = self.guidance_fn(
                     noisy_images,
                     optvars,
                     seed=seed1,
@@ -731,7 +731,7 @@ class DiffusionModel(DeepGenerativeModel):
                     **kwargs,
                 )
             else:
-                gradients, (error, guidance_outputs) = self.guidance_fn(
+                gradients, (error, (pred_noises, pred_images)) = self.guidance_fn(
                     noisy_images,
                     seed=seed1,
                     measurements=measurements,
@@ -741,13 +741,6 @@ class DiffusionModel(DeepGenerativeModel):
                     **kwargs,
                 )
                 optvar_grads = None
-
-            if not isinstance(guidance_outputs, tuple) or len(guidance_outputs) < 2:
-                raise ValueError(
-                    "Guidance function must return (pred_noises, pred_images) or "
-                    "(pred_noises, pred_images, ...)."
-                )
-            pred_noises, pred_images = guidance_outputs[:2]
 
             if with_adam:
                 m = beta1 * m + (1 - beta1) * gradients
@@ -779,8 +772,8 @@ class DiffusionModel(DeepGenerativeModel):
                 next_noisy_images = next_noisy_images - grad_update
                 pred_images = pred_images -  grad_update
 
-                if isinstance(self.guidance_fn, DPS_SIM_TOT) and optvar_grads is not None:
-                    if with_adam:
+                if isinstance(self.guidance_fn, DPS_SIM_TOT):
+                    if optvars_with_adam:
                         opt_m = jax.tree_util.tree_map(
                             lambda mm, g: beta1 * mm + (1 - beta1) * g,
                             opt_m,
@@ -814,6 +807,7 @@ class DiffusionModel(DeepGenerativeModel):
                         optvars,
                         opt_update,
                     )
+
 
             next_noisy_images = ops.clip(next_noisy_images, self.input_range[0], self.input_range[1])
             pred_images = ops.clip(pred_images, self.input_range[0], self.input_range[1])
@@ -1113,7 +1107,7 @@ class DPS_SIM_TOT(DiffusionGuidance):
             return grads, (error, aux)
 
         self.gradient_fn = jax.jit(_grad_fn) if not self.disable_jit else _grad_fn
-
+    
     def compute_error(
         self,
         noisy_images,
@@ -1149,14 +1143,8 @@ class DPS_SIM_TOT(DiffusionGuidance):
         # implementation, which uses a standard L2:
         # https://github.com/DPS2022/diffusion-posterior-sampling/blob/effbde7325b22ce8dc3e2c06c160c021e743a12d/guided_diffusion/condition_methods.py#L31  # noqa: E501
         output = self.operator.forward(pred_images, seed, optvars, **kwargs)
-        if not isinstance(output, tuple) or len(output) < 4:
-            raise ValueError(
-                "Simulator_Total.forward must return "
-                "(rf_data, tx_indices, freq_indices, el_indices)."
-            )
 
-        rf_data, tx_indices, freq_indices, el_indices = output[:4]
-
+        rf_data, tx_indices, freq_indices, el_indices = output
 
         # Select the sampled measurement subspace axis-by-axis using backend-agnostic ops.
         sampled_measurements = ops.take(measurements, tx_indices, axis=1)

@@ -45,6 +45,7 @@ import numpy as np
 from keras import ops
 
 from zea.beamform.lens_correction import compute_lens_corrected_travel_times
+from zea.func.tensor import vmap
 
 def simulate_rf(
     scatterer_positions,
@@ -137,66 +138,59 @@ def simulate_rf(
     freqs = ops.take(freqs, freq_indices)
 
     waveform_spectrum = pulse_spectrum_fn(freqs)
-    parts = []
+    # [n_scat, n_txel, n_rxel]
+    dist_total = dist_tx[:, :, None] + dist_rx[:, None, :]
 
-    for tx in range(len(tx_indices)):
-        tx_idx = ops.array(tx)
+    scat_pos_relative_to_probe_tx = scatterer_positions[:, None] - probe_geometry_tx[None]
+    scat_pos_relative_to_probe_rx = scatterer_positions[:, None] - probe_geometry_rx[None]
 
-        # [n_scat, n_txel, rxel]
-        dist_total = dist_tx[:, :, None] + dist_rx[:, None, :]
+    # Compute 3D directivity terms that are independent of transmit index.
+    theta_tx = ops.arctan2(
+        scat_pos_relative_to_probe_tx[:, :, 0], scat_pos_relative_to_probe_tx[:, :, 2]
+    )
+    phi_tx = ops.arctan2(
+        scat_pos_relative_to_probe_tx[:, :, 1], scat_pos_relative_to_probe_tx[:, :, 2]
+    )
+    theta_rx = ops.arctan2(
+        scat_pos_relative_to_probe_rx[:, :, 0], scat_pos_relative_to_probe_rx[:, :, 2]
+    )
+    phi_rx = ops.arctan2(
+        scat_pos_relative_to_probe_rx[:, :, 1], scat_pos_relative_to_probe_rx[:, :, 2]
+    )
 
-        # [n_scat, n_txel, n_rxel]
-        tau_total = (
-            (dist_total / sound_speed) + t0_delays[tx_idx][None, :, None] - initial_times[tx_idx]
-        )
+    directivity_tx = directivity(
+        freqs[None, None, None],
+        theta_tx[..., None, None],
+        element_width,
+        sound_speed,
+    ) * directivity(
+        freqs[None, None, None],
+        phi_tx[..., None, None],
+        element_width,
+        sound_speed,
+    )
+    directivity_rx = directivity(
+        freqs[None, None, None],
+        theta_rx[:, None, :, None],
+        element_width,
+        sound_speed,
+    ) * directivity(
+        freqs[None, None, None],
+        phi_rx[:, None, :, None],
+        element_width,
+        sound_speed,
+    )
 
-        scat_pos_relative_to_probe_tx = scatterer_positions[:, None] - probe_geometry_tx[None]
-        scat_pos_relative_to_probe_rx = scatterer_positions[:, None] - probe_geometry_rx[None]
+    attenuation = attenuate(
+        freqs[None, None, None],
+        attenuation_coef=attenuation_coef,
+        dist=dist_total[..., None],
+    )
 
-        # Compute 3D directivity
-        theta_tx = ops.arctan2(
-            scat_pos_relative_to_probe_tx[:, :, 0], scat_pos_relative_to_probe_tx[:, :, 2]
-        )
-        phi_tx = ops.arctan2(
-            scat_pos_relative_to_probe_tx[:, :, 1], scat_pos_relative_to_probe_tx[:, :, 2]
-        )
-        theta_rx = ops.arctan2(
-            scat_pos_relative_to_probe_rx[:, :, 0], scat_pos_relative_to_probe_rx[:, :, 2]
-        )
-        phi_rx = ops.arctan2(
-            scat_pos_relative_to_probe_rx[:, :, 1], scat_pos_relative_to_probe_rx[:, :, 2]
-        )
-
-        directivity_tx = directivity(
-            freqs[None, None, None],
-            theta_tx[..., None, None],
-            element_width,
-            sound_speed,
-        ) * directivity(
-            freqs[None, None, None],
-            phi_tx[..., None, None],
-            element_width,
-            sound_speed,
-        )
-        directivity_rx = directivity(
-            freqs[None, None, None],
-            theta_rx[:, None, :, None],
-            element_width,
-            sound_speed,
-        ) * directivity(
-            freqs[None, None, None],
-            phi_rx[:, None, :, None],
-            element_width,
-            sound_speed,
-        )
-
-        attenuation = attenuate(
-            freqs[None, None, None],
-            attenuation_coef=attenuation_coef,
-            dist=dist_total[..., None],
-        )
-
-        spread_atten = spread(dist_total[..., None])
+    spread_atten = spread(dist_total[..., None])
+    
+    def _simulate_single_tx(t0_delay_tx, initial_time_tx, tx_apodization_tx):
+        tau_total = (dist_total / sound_speed) + t0_delay_tx[None, :, None] - initial_time_tx
 
         result = (
             waveform_spectrum[None, None, None]
@@ -208,7 +202,7 @@ def simulate_rf(
             )
             * ops.cast(
                 scatterer_magnitudes[:, None, None, None]
-                * tx_apodizations[tx, None, :, None, None]
+                * tx_apodization_tx[None, :, None, None]
                 * directivity_tx
                 * directivity_rx
                 * attenuation
@@ -217,14 +211,10 @@ def simulate_rf(
             )
         )
 
-        # Sum over all transmitting elements and scatterers
-        result = ops.sum(result, axis=[0, 1])
+        # Sum over all transmitting elements and scatterers.
+        return ops.sum(result, axis=[0, 1])
 
-        # result = ops.irfft((ops.real(result), ops.imag(result)))
-
-        parts.append(result)
-
-    rf_data = ops.stack(parts, axis=0)
+    rf_data = vmap(_simulate_single_tx)(t0_delays, initial_times, tx_apodizations)
     
     rf_data = ops.transpose(rf_data, (0, 2, 1))[...,None]
     return rf_data

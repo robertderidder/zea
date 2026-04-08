@@ -17,6 +17,7 @@ from zea.internal.registry import operator_registry
 from zea.func import translate
 from zea.func.tensor import split_seed
 from zea.simulator_zea_partial import simulate_rf
+from zea.beamform.pixelgrid import polar_pixel_grid, cartesian_pixel_grid, check_for_aliasing
 
 class Operator(abc.ABC, Object):
     """Operator base class.
@@ -628,6 +629,7 @@ class Simulator_Total(Operator):
         self.n_freq_samples = n_freq_samples
         self.n_tx_samples = n_tx_samples
         self.positions = ops.reshape(self.scan.grid, (-1, 3))
+        #self.position = self.get_positions(custom_shape)
         if add_jitter:
             wavelength = self.scan.sound_speed / self.scan.center_frequency
             jitter_scale = jitter_scale_wavelengths * wavelength
@@ -642,7 +644,16 @@ class Simulator_Total(Operator):
         else:
             self.n_scat_per_it = int(n_scat_per_it)
         
-    
+    def get_positions(self, custom_shape):
+        if self.scan.grid_type == 'cartesian':
+            grid = cartesian_pixel_grid(self.scan.xlims, self.scan.zlims, grid_size_x=custom_shape[0], grid_size_z=custom_shape[1])
+        elif self.scan.grid_type == 'polar':
+            grid = polar_pixel_grid(self.scan.xlims, self.scan.zlims, grid_size_x=custom_shape[0], grid_size_z=custom_shape[1])
+        else:
+            raise ValueError(f"Unsupported grid type: {self.scan.grid_type}")
+        return grid
+
+
     def img_to_magnitude(self,image, n_frames):
         """
         Convert input image to scatterer magnitudes for the simulator.
@@ -659,7 +670,34 @@ class Simulator_Total(Operator):
         mask = ops.logical_not(self.positions[:,2] < 0)[None,:]
         image_lin = mask * image_lin
         return image_lin
+
+    def symlog(self, x, epsilon=0.01):
+        """Apply symmetric logarithm to x with a small epsilon to avoid singularity at 0."""
+        x_scaled = x / epsilon
+        return ops.sign(x_scaled) * ops.log(1.0 + ops.abs(x_scaled))
     
+    def reparametrize_optvars(self, scan, optvars):
+        """Map raw optvars to physical offsets used by the simulator."""
+        position_offset_raw, sound_speed_offset_raw = optvars
+
+        position_offset_raw = ops.convert_to_tensor(position_offset_raw, dtype=self.positions.dtype)
+        sound_speed_offset_raw = ops.convert_to_tensor(sound_speed_offset_raw, dtype=self.positions.dtype)
+
+        if len(position_offset_raw.shape) != 2 or position_offset_raw.shape[-1] != 3:
+            raise ValueError(
+                "position_offset must have shape (n_scatterers, 3)."
+            )
+
+        ##To be removed
+        max_position_offset_wl = 1.0
+        max_sound_speed_offset_mps = 100.0
+        wavelength = scan.wavelength
+        max_position_offset_m = max_position_offset_wl * wavelength
+        position_offset = ops.tanh(position_offset_raw) * max_position_offset_m
+        sound_speed_offset = ops.tanh(sound_speed_offset_raw) * max_sound_speed_offset_mps
+
+        return position_offset, sound_speed_offset
+
     def sample_indices(self, seed):
         """
         Sample scatter points from the scan grid to speed up simulation.
@@ -682,13 +720,8 @@ class Simulator_Total(Operator):
 
         if optvars is None:
             raise ValueError(
-                "Simulator_Total.forward requires optvars=(position_offset, element_gains, "
-                "sound_speed_offset, initial_time_offset)."
+                "Simulator_Total.forward requires optvars=(position_offset, sound_speed_offset)."
             )
-
-        position_offset, element_gains, sound_speed_offset, initial_time_offset = optvars
-        if seed is None:
-            seed = jax.random.key(0)
 
         assert len(image.shape)==4, f"Image should be of shape [n_frames, H, W, 1] but got {image.shape}"
         scat_seed, el_seed, tx_seed, freq_seed = split_seed(seed, 4)   
@@ -704,11 +737,9 @@ class Simulator_Total(Operator):
         # Uniform sampling without replacement for elements and transmits
         el_random = keras.random.uniform(shape=(self.scan.n_el,), seed=el_seed)
         el_indices = ops.argsort(el_random)[:self.n_el_samples]
-        el_indices = ops.sort(el_indices)
         
         tx_random = keras.random.uniform(shape=(self.scan.n_tx,), seed=tx_seed)
         tx_indices = ops.argsort(tx_random)[:self.n_tx_samples]
-        tx_indices = ops.sort(tx_indices)
 
         # Sample frequencies with Gaussian weighting centered at carrier frequency
         freq_bins = ops.arange(self.n_freqs, dtype='float32')
@@ -720,55 +751,19 @@ class Simulator_Total(Operator):
         log_probs = ops.log(ops.maximum(probs, 1e-10))  # Avoid log(0)
         gumbel = -ops.log(-ops.log(keras.random.uniform(shape=(self.n_freqs,), seed=freq_seed)) + 1e-10)
         freq_indices = ops.argsort(-(log_probs + gumbel))[:self.n_freq_samples]
-        freq_indices = ops.sort(freq_indices)
         
         el_indices = ops.sort(el_indices)
         freq_indices = ops.sort(freq_indices)
         tx_indices = ops.sort(tx_indices)
 
-        # Apply optvars
-        if position_offset is not None:
-            position_offset = ops.convert_to_tensor(position_offset, dtype=positions.dtype)
-            if len(position_offset.shape) != 2 or position_offset.shape[-1] not in (2, 3):
-                raise ValueError(
-                    "position_offset must have shape (n_scat, 2) or (n_scat, 3)."
-                )
-            if position_offset.shape[-1] == 2:
-                position_offset = ops.concatenate(
-                    [
-                        position_offset[:, :1],
-                        ops.zeros_like(position_offset[:, :1]),
-                        position_offset[:, 1:2],
-                    ],
-                    axis=-1,
-                )
+        #Apply optvars reparameterization
+        optvars = self.reparametrize_optvars(self.scan, optvars)
 
-            if position_offset.shape[0] == self.positions.shape[0]:
-                sampled_position_offset = ops.take(position_offset, scat_indices, axis=0)
-            elif position_offset.shape[0] == positions.shape[0]:
-                sampled_position_offset = position_offset
-            else:
-                raise ValueError(
-                    "position_offset first dimension must match total or sampled scatterers."
-                )
-            positions = positions + sampled_position_offset
-
-        if element_gains is None:
-            element_gains = ops.ones((self.scan.n_el,), dtype=positions.dtype)
-        element_gains = ops.reshape(ops.convert_to_tensor(element_gains), (-1,))
-        if element_gains.shape[0] != self.scan.n_el:
-            raise ValueError(
-                f"element_gains must have shape ({self.scan.n_el},), got {element_gains.shape}."
-            )
-        sampled_gains = ops.take(element_gains, el_indices, axis=0)
-
-        if sound_speed_offset is None:
-            sound_speed_offset = 0.0
-        if initial_time_offset is None:
-            initial_time_offset = 0.0
-
+        position_offset, sound_speed_offset = optvars
+        positions = positions+ops.take(position_offset, scat_indices, axis=0)
+        # element_gains = ops.take(element_gains, el_indices, axis=0)
         sound_speed = self.scan.sound_speed + sound_speed_offset
-        initial_times = self.scan.initial_times + initial_time_offset
+        # initial_times = self.scan.initial_times + initial_time_offset
 
         # Compute scatterer padding for chunking
         n_scat = positions.shape[0]
@@ -797,7 +792,7 @@ class Simulator_Total(Operator):
                 center_frequency=self.scan.center_frequency,
                 sampling_frequency=self.scan.sampling_frequency,
                 t0_delays=self.scan.t0_delays,
-                initial_times=initial_times,
+                initial_times=self.scan.initial_times,
                 element_width=self.scan.element_width,
                 attenuation_coef=self.scan.attenuation_coef,
                 tx_apodizations=self.scan.tx_apodizations,
@@ -832,7 +827,7 @@ class Simulator_Total(Operator):
         _, rf_data = ops.scan(process_frame, None, magnitudes)
 
         # Multiply by selected receive-element gains
-        rf_data = rf_data * sampled_gains[None, None, None, :, None]
+        # rf_data = rf_data * element_gains[None, None, None, :, None]
 
         return rf_data, tx_indices, freq_indices, el_indices
     
