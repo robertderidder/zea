@@ -234,9 +234,10 @@ def directivity(f, theta, element_width, sound_speed, rigid_baffle=True):
         array-like: The directivity of the element.
     """
 
-    wavelength = sound_speed / f
-
-    response = sinc(element_width / wavelength * ops.sin(theta))
+    # Use f / c form instead of c / f to avoid undefined gradients at f=0 (DC bin).
+    safe_sound_speed = ops.maximum(sound_speed, 1e-6)
+    argument = (element_width * f / safe_sound_speed) * ops.sin(theta)
+    response = sinc(argument)
     if not rigid_baffle:
         response *= ops.cos(theta)
     return response

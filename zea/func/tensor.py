@@ -1475,12 +1475,13 @@ def fori_loop(lower, upper, body_fun, init_val, disable_jit=False):
     return val
 
 
-def L2(x):
+def L2(x, eps=1e-12):
     """L2 norm of a real tensor.
 
     Implementation of L2 norm for complex vectors: https://mathworld.wolfram.com/L2-Norm.html
     """
-    return ops.sqrt(ops.sum(ops.abs(x)**2))
+    # Add a tiny epsilon for stable gradients when ||x|| is exactly zero.
+    return ops.sqrt(ops.sum(ops.abs(x) ** 2) + eps)
 
 
 def L1(x):

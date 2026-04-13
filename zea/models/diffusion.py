@@ -653,7 +653,7 @@ class DiffusionModel(DeepGenerativeModel):
         """
         with_adam = kwargs.pop("with_adam", False)
         adam_params = kwargs.pop("adam_params", None)
-        optvars = kwargs.pop("optvars", None)
+        optvars_dict = kwargs.pop("optvars_dict", None)
         omega_optvars = kwargs.pop("omega_optvars", omega)
         optvars_with_adam = kwargs.pop("optvars_with_adam", with_adam)
 
@@ -674,17 +674,20 @@ class DiffusionModel(DeepGenerativeModel):
             else:
                 raise ValueError("adam_params must be a dict with keys beta1, beta2, eps, m, v")
 
-        if isinstance(self.guidance_fn, DPS_SIM_TOT) and optvars is None:
+        if isinstance(self.guidance_fn, DPS_SIM_TOT) and optvars_dict is None:
             raise ValueError(
-                "DPS_SIM_TOT requires optvars=(position_offset, sound_speed_offset)."
+                "DPS_SIM_TOT requires optvars_dict."
             )
 
+        if optvars_dict is not None and not isinstance(optvars_dict, dict):
+            raise ValueError("optvars_dict must be a dict mapping variable names to tensors.")
+
         if isinstance(self.guidance_fn, DPS_SIM_TOT):
-            optvars = jax.tree_util.tree_map(ops.convert_to_tensor, optvars)
+            optvars = jax.tree_util.tree_map(ops.convert_to_tensor, optvars_dict)
             opt_m = jax.tree_util.tree_map(ops.zeros_like, optvars)
             opt_v = jax.tree_util.tree_map(ops.zeros_like, optvars)
         else:
-            opt_m, opt_v = None, None
+            optvars, opt_m, opt_v = None, None, None
 
         num_images, *input_shape = ops.shape(initial_noise)
 
@@ -761,6 +764,7 @@ class DiffusionModel(DeepGenerativeModel):
                 seed=seed2,
                 stochastic_sampling=stochastic_sampling,
             )
+            next_noisy_images = noisy_images - grad_update
 
             if isinstance(self.guidance_fn, DSG):
                 raise NotImplementedError("DSG guidance not implemented yet")
