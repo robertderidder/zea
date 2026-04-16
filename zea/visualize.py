@@ -3,6 +3,7 @@
 import importlib.resources
 from typing import List, Optional, Tuple, Union
 
+from matplotlib import animation
 import matplotlib.pyplot as plt
 import numpy as np
 from keras.ops.image import crop_images
@@ -39,6 +40,8 @@ def plot_image_grid(
     vmax: Optional[Union[float, List[float]]] = None,
     interpolation: Optional[str] = "auto",
     titles: Optional[List[str]] = None,
+    xlabels: Optional[List[str]] = None,
+    ylabels: Optional[List[str]] = None,
     suptitle: Optional[str] = None,
     aspect: Optional[Union[str, int, float, List[Union[str, int, float]]]] = None,
     figsize: Optional[Tuple[float, float]] = None,
@@ -198,6 +201,10 @@ def plot_image_grid(
 
         if titles:
             ax.set_title(titles[i], color=text_color)
+        if xlabels:
+            ax.set_xlabel(xlabels[i], color=text_color)
+        if ylabels:
+            ax.set_ylabel(ylabels[i], color=text_color)
 
     if suptitle:
         fig.suptitle(suptitle, color=text_color)
@@ -206,6 +213,107 @@ def plot_image_grid(
     # use bbox_inches="tight" for proper tight layout when saving
     return fig, fig_contents
 
+
+def animate_image_grid(
+    image_grids,
+    path,
+    ncols: Optional[int] = None,
+    cmap: Optional[Union[str, List[str]]] = "gray",
+    vmin: Optional[Union[float, List[float]]] = None,
+    vmax: Optional[Union[float, List[float]]] = None,
+    interpolation: Optional[str] = "auto",
+    titles: Optional[List[str]] = None,
+    xlabels: Optional[List[str]] = None,
+    ylabels: Optional[List[str]] = None,
+    suptitle: Optional[str] = None,
+    aspect: Optional[Union[str, int, float, List[Union[str, int, float]]]] = None,
+    figsize: Optional[Tuple[float, float]] = None,
+    remove_axis: Optional[bool] = True,
+    background_color: Optional[str] = None,
+    text_color: Optional[str] = None,
+    axes_pad: float = 0.1,
+    interval: int = 100,
+    dpi: int = 80,
+):
+    """Animate a sequence of image grids and save to disk.
+
+    Args:
+        image_grids: Sequence where each element is a list/batch of images
+            accepted by ``plot_image_grid``.
+        path: Output file path, e.g. ``"trajectory.gif"``.
+        ncols: Number of grid columns.
+        cmap: Colormap (string or list).
+        vmin: Min display values (scalar or list).
+        vmax: Max display values (scalar or list).
+        interpolation: Interpolation for matplotlib imshow.
+        titles: Subplot titles.
+        suptitle: Figure supertitle.
+        aspect: Aspect ratio(s) for imshow.
+        figsize: Figure size.
+        remove_axis: Whether to hide axes.
+        background_color: Figure/axes background color.
+        text_color: Text color for titles.
+        axes_pad: Padding between grid cells.
+        interval: Milliseconds between frames.
+        dpi: Save DPI.
+    """
+    if interval <= 0:
+        raise ValueError("interval must be a positive integer (milliseconds).")
+    if len(image_grids) == 0:
+        raise ValueError("image_grids must be a non-empty sequence.")
+
+    fig, fig_contents = plot_image_grid(
+        image_grids[0],
+        ncols=ncols,
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+        interpolation=interpolation,
+        titles=titles,
+        xlabels = xlabels,
+        ylabels = ylabels,
+        suptitle=f'{suptitle}_frame_0' if suptitle else None,
+        aspect=aspect,
+        figsize=figsize,
+        remove_axis=remove_axis,
+        background_color=background_color,
+        text_color=text_color,
+        axes_pad=axes_pad,
+    )
+
+    def update(frame_idx):
+        nonlocal fig_contents
+        _, fig_contents = plot_image_grid(
+            image_grids[frame_idx],
+            ncols=ncols,
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            interpolation=interpolation,
+            titles=titles,
+            xlabels=xlabels,
+            ylabels=ylabels,
+            suptitle=f'{suptitle}_frame_{frame_idx}' if suptitle else None,
+            aspect=aspect,
+            fig=fig,
+            fig_contents=fig_contents,
+            remove_axis=remove_axis,
+            background_color=background_color,
+            text_color=text_color,
+            axes_pad=axes_pad,
+        )
+        return fig_contents
+
+    ani = animation.FuncAnimation(
+        fig,
+        update,
+        frames=len(image_grids),
+        blit=False,
+        interval=interval,
+    )
+    plt.close(fig)
+    fps = max(1, 1000 // interval)
+    ani.save(path, writer="imagemagick", fps=fps, dpi=dpi)
 
 def plot_quadrants(ax, array, fixed_coord, cmap, slice_index, stride=1, centroid=None, **kwargs):
     """

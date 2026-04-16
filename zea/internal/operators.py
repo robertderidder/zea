@@ -12,6 +12,11 @@ from keras import ops
 from zea.internal.core import Object
 from zea.internal.registry import operator_registry
 
+#own imports
+from zea.func.tensor import split_seed, translate
+import keras
+from zea.simulator_subsample import simulate_rf
+import jax
 
 class Operator(abc.ABC, Object):
     """Operator base class.
@@ -196,3 +201,267 @@ class FourierBlurOperator(Operator):
 
     def __str__(self):
         return f"y = F^(-1)(M * F(x)) filter at {self.cutoff_freq}"
+
+
+class Simulator(Operator):
+    """
+    Simulator opeator class. This simulates rf data given an image. 
+    The simulation is done by converting each pixel into a scatter point
+    """
+    def __init__(self,
+                 scan,
+                 n_tx_samples,
+                 n_freq_samples,
+                 n_el_samples,
+                 scatterer_chunk_size = 256,):
+        super().__init__()
+        self.scan = scan
+        self.n_tx_samples = n_tx_samples
+        self.n_freq_samples = n_freq_samples
+        self.n_el_samples = n_el_samples
+        self.scatterer_chunk_size = scatterer_chunk_size
+        self.positions = self.scan.flatgrid
+        self.n_freqs = 2**int(ops.ceil(ops.log2(self.scan.n_ax))) // 2 + 1
+
+    def forward(self, image, seed, **kwargs):
+        assert len(image.shape) == 4, "Image should have shape (B, H, W, C)"
+        seed_el, seed_freq, seed_tx = split_seed(seed, 3)
+        
+        n_frames, *img_shape = image.shape
+        magnitudes = self.image_to_magnitudes(image, n_frames)
+
+        #sample el, freq and tx
+        el_random = keras.random.uniform(shape=(self.scan.n_el,), seed=seed_el)
+        el_indices = ops.argsort(el_random)[:self.n_el_samples]
+
+        freq_gaussian_probs = kwargs.get("freq_gaussian_probs", False)
+        if freq_gaussian_probs:
+            freq_bins = ops.arange(self.n_freqs)
+            center_freq_bin = self.n_freqs // 2
+            sigma = self.n_freqs / 8  # Adjust sigma as needed
+            gaussian_probs = ops.exp(-0.5 * ((freq_bins - center_freq_bin) / sigma) ** 2)
+            p = gaussian_probs / ops.sum(gaussian_probs)
+        else:
+            p = ops.ones(self.n_freqs) / self.n_freqs
+
+        log_probs = ops.log(ops.maximum(p, 1e-10))
+        gumbel = -ops.log(-ops.log(keras.random.uniform(shape=(self.n_freqs,), seed=seed_freq)))
+        freq_random = log_probs + gumbel
+        freq_indices = ops.argsort(freq_random)[:self.n_freq_samples]
+
+        tx_random = keras.random.uniform(shape=(self.scan.n_tx,), seed=seed_tx)
+        tx_indices = ops.argsort(tx_random)[:self.n_tx_samples]
+
+        el_indices = ops.sort(el_indices)
+        freq_indices = ops.sort(freq_indices)
+        tx_indices = ops.sort(tx_indices)
+
+        # Compute scatterer padding for chunking
+        n_scat = self.positions.shape[0]
+        chunk_size = self.scatterer_chunk_size
+        n_scat_padded = n_scat + (chunk_size - (n_scat % chunk_size)) % chunk_size
+        n_chunks = n_scat_padded // chunk_size
+
+        # Pad and pre-reshape positions into (n_chunks, chunk_size, 3)
+        positions_padded = ops.pad(self.positions, ((0, n_scat_padded - n_scat), (0, 0)))
+        position_chunks = ops.reshape(positions_padded, (n_chunks, chunk_size, 3))
+        magnitudes_padded = ops.pad(magnitudes, ((0, 0), (0, n_scat_padded - n_scat)))
+        
+        def simulate_chunk(pos_chunk, mag_chunk):
+            """Simulate RF for a single scatterer chunk."""
+            return simulate_rf(
+                scatterer_positions=pos_chunk,
+                scatterer_magnitudes=mag_chunk,
+                el_indices=el_indices,
+                freq_indices=freq_indices,
+                tx_indices=tx_indices,
+                probe_geometry=self.scan.probe_geometry,
+                apply_lens_correction=self.scan.apply_lens_correction,
+                sound_speed=self.scan.sound_speed,
+                lens_sound_speed=self.scan.lens_sound_speed,
+                lens_thickness=self.scan.lens_thickness,
+                n_ax=self.scan.n_ax,
+                center_frequency=self.scan.center_frequency,
+                sampling_frequency=self.scan.sampling_frequency,
+                t0_delays=self.scan.t0_delays,
+                initial_times=self.scan.initial_times,
+                element_width=self.scan.element_width,
+                attenuation_coef=self.scan.attenuation_coef,
+                tx_apodizations=self.scan.tx_apodizations,
+            )
+        
+        @jax.checkpoint
+        def accumulate_chunks(rf_accumulated, chunk):
+            pos_chunk, mag_chunk = chunk
+            rf_accumulated += simulate_chunk(pos_chunk, mag_chunk)
+            return rf_accumulated, None
+
+        @jax.checkpoint
+        def process_frame(carry, frame_data):
+            magnitude_chunks = ops.reshape(frame_data, (n_chunks, chunk_size))
+            rf_init = ops.zeros((self.n_tx_samples, self.n_freq_samples, self.n_el_samples, 1), dtype='complex64')
+            rf_accumulated, _ = ops.scan(accumulate_chunks, rf_init, (position_chunks, magnitude_chunks))
+            return carry, rf_accumulated
+        
+        _, rf_data = ops.scan(process_frame, None, magnitudes_padded)
+
+        return rf_data, tx_indices, freq_indices, el_indices
+
+    def image_to_magnitudes(self, image, n_frames):
+        image = translate(image, range_from=(-1,1), range_to=self.scan.dynamic_range)
+        image_lin = 10**(image/20)  # convert from dB to linear scale
+        image_lin = ops.reshape(image_lin, (n_frames, -1))
+        #set magnitudes of pixels z<0 to 0r
+        mask = ops.logical_not(self.positions[:,2] < 0)[None, :]
+        image_lin = image_lin * mask
+        return image_lin
+
+    def __str__(self):
+        return f"Simulator with {self.n_tx_samples} tx samples, {self.n_freq_samples} freq samples, and {self.n_el_samples} el samples. Not optimizing auxiliary variables."
+
+    def transpose(self, data, *args, **kwargs):
+        raise NotImplementedError("Transpose not implemented for Simulator operator.")
+    
+class Simulator_Total(Operator):
+    """ Simulator that optimizes other auxiliary variables. 
+    This may not depend on the dynamic range, because that is a visualization parameter, not part of the forward model """
+
+    def __init__(self,
+             scan,
+             n_tx_samples,
+             n_freq_samples,
+             n_el_samples,
+             scatterer_chunk_size = 256):
+        super().__init__()
+        self.scan = scan
+        self.n_tx_samples = n_tx_samples
+        self.n_freqs = 2**int(ops.ceil(ops.log2(self.scan.n_ax))) // 2 + 1
+        self.n_freq_samples = n_freq_samples
+        self.n_el_samples = n_el_samples
+        self.scatterer_chunk_size = scatterer_chunk_size
+        self.positions = self.scan.flatgrid
+        
+    def img_to_magnitude(self, image, positions):
+        n_frames = image.shape[0]
+        image = ops.reshape(image, (n_frames, -1))
+        image = self.symlog(image)
+        mask = ops.logical_not(positions[:,2] < 0)[None, :]
+        image = image * mask
+        return image
+    
+    def symlog(self, x, epsilon=0.01):
+        x_scaled = x / epsilon
+        return ops.sign(x) * ops.log1p(ops.abs(x_scaled))
+
+    def reparameterize_optvars(self, scan, optvars_tree):
+        out = dict(optvars_tree)
+        out["positions"] = out.get("positions", ops.zeros_like(self.positions)) * scan.wavelength
+        out["sound_speed_offset"] = out.get("sound_speed_offset", 0.0) * scan.sound_speed
+        out["element_gains"] = out.get(
+            "element_gains",
+            ops.zeros((self.scan.n_el,), dtype="float32"),
+        ) * 1e-3
+        out["initial_times"] = out.get("initial_times", ops.zeros_like(self.scan.initial_times)) * 1e-6
+        out["attenuation_coef"] = out.get("attenuation_coef", 0.0) * 1e-3  # convert from dB/cm/MHz to dB/m/MHz
+        return out
+    
+    def forward(self, image, optvars, seed, **kwargs):
+        assert isinstance(optvars, dict), "optvars should be a dict"
+        
+        optvars_tree = self.reparameterize_optvars(self.scan, optvars)
+        positions = self.positions + optvars_tree.get("positions", ops.zeros_like(self.positions))
+        sound_speed = self.scan.sound_speed + optvars_tree.get("sound_speed_offset", 0.0)
+        attenuation_coef = self.scan.attenuation_coef + optvars_tree.get("attenuation_coef", 0.0)
+        element_gains = ops.ones((self.scan.n_el,), dtype="float32") + optvars_tree.get(
+            "element_gains",
+            ops.zeros((self.scan.n_el,), dtype="float32"),
+        )
+        initial_times = self.scan.initial_times + optvars_tree.get("initial_times", ops.zeros_like(self.scan.initial_times))
+
+        assert len(image.shape) == 4, "Image should have shape (B, H, W, C)"
+        magnitudes = self.img_to_magnitude(image, positions)
+
+        seed_el, seed_freq, seed_tx = split_seed(seed, 3)
+
+        #sample el, freq and tx
+        tx_random = keras.random.uniform(shape=(self.scan.n_tx,), seed=seed_tx)
+        tx_indices = ops.argsort(tx_random)[:self.n_tx_samples] 
+
+        freq_gaussian_probs = kwargs.get("freq_gaussian_probs", False)
+        if freq_gaussian_probs:
+            freq_bins = ops.arange(self.n_freqs)
+            center_freq_bin = self.n_freqs // 2
+            sigma = self.n_freqs / 8  # Adjust sigma as needed
+            gaussian_probs = ops.exp(-0.5 * ((freq_bins - center_freq_bin) / sigma) ** 2)
+            p = gaussian_probs / ops.sum(gaussian_probs)
+        else:
+            p = ops.ones(self.n_freqs) / self.n_freqs
+
+        log_probs = ops.log(ops.maximum(p, 1e-10))
+        gumbel = -ops.log(-ops.log(keras.random.uniform(shape=(self.n_freqs,), seed=seed_freq)))
+        freq_random = log_probs + gumbel
+        freq_indices = ops.argsort(freq_random)[:self.n_freq_samples]
+
+        el_random = keras.random.uniform(shape=(self.scan.n_el,), seed=seed_el)
+        el_indices = ops.argsort(el_random)[:self.n_el_samples]
+
+        tx_indices = ops.sort(tx_indices)
+        freq_indices = ops.sort(freq_indices)
+        el_indices = ops.sort(el_indices)
+
+        # Compute scatterer padding for chunking
+        n_scat = self.positions.shape[0]
+        chunk_size = self.scatterer_chunk_size
+        n_scat_padded = n_scat + (chunk_size - (n_scat % chunk_size)) % chunk_size
+        n_chunks = n_scat_padded // chunk_size  
+
+        #pad and reshape positions and magnitudes for chunking
+        positions = ops.pad(positions, ((0, n_scat_padded - n_scat), (0, 0)))
+        position_chunks = ops.reshape(positions, (n_chunks, chunk_size, 3))
+        magnitudes_padded = ops.pad(magnitudes, ((0, 0), (0, n_scat_padded - n_scat)))
+
+        def simulate_chunk(scat_chunk, amp_chunk):
+            """Simulate RF for a single scatterer chunk."""
+            return simulate_rf(
+                scatterer_positions=scat_chunk,
+                scatterer_magnitudes=amp_chunk,
+                el_indices=el_indices,
+                freq_indices=freq_indices,
+                tx_indices=tx_indices,
+                probe_geometry=self.scan.probe_geometry,
+                apply_lens_correction=self.scan.apply_lens_correction,
+                sound_speed=sound_speed,
+                lens_sound_speed=self.scan.lens_sound_speed,
+                lens_thickness=self.scan.lens_thickness,
+                n_ax=self.scan.n_ax,
+                center_frequency=self.scan.center_frequency,
+                sampling_frequency=self.scan.sampling_frequency,
+                t0_delays=self.scan.t0_delays,
+                initial_times=initial_times,
+                element_width=self.scan.element_width,
+                attenuation_coef=attenuation_coef,
+                tx_apodizations=self.scan.tx_apodizations,
+            )
+        
+        @jax.checkpoint
+        def accumulate_chunks(rf_accumulated, chunk):
+            scat_chunk, amp_chunk = chunk
+            rf_accumulated += simulate_chunk(scat_chunk, amp_chunk)
+            return rf_accumulated, None
+
+        @jax.checkpoint
+        def process_frame(carry, frame_data):
+            magnitude_chunks = ops.reshape(frame_data, (n_chunks, chunk_size))
+            rf_init = ops.zeros((self.n_tx_samples, self.n_freq_samples, self.n_el_samples, 1), dtype='complex64')
+            rf_accumulated, _ = ops.scan(accumulate_chunks, rf_init, (position_chunks, magnitude_chunks))
+            return carry, rf_accumulated
+        
+        _, rf_data = ops.scan(process_frame, None, magnitudes_padded)
+        element_gains = ops.take(element_gains, el_indices)
+        return element_gains[None, None, :, None]*rf_data, tx_indices, freq_indices, el_indices
+        
+    def __str__(self):
+        return f"Simulator_Total with {self.n_tx_samples} tx samples, {self.n_freq_samples} freq samples, and {self.n_el_samples} el samples. Optimizing auxiliary variables"
+    
+    def transpose(self, data, *args, **kwargs):
+        raise NotImplementedError("Transpose not implemented for Simulator_Total operator.")   
