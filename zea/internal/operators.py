@@ -331,7 +331,9 @@ class Simulator_Total(Operator):
              n_tx_samples,
              n_freq_samples,
              n_el_samples,
-             scatterer_chunk_size = 256):
+             scatterer_chunk_size = 256,
+             position_offset = 0.0,
+             sound_speed_offset_scale = 100.0):
         super().__init__()
         self.scan = scan
         self.n_tx_samples = n_tx_samples
@@ -339,12 +341,13 @@ class Simulator_Total(Operator):
         self.n_freq_samples = n_freq_samples
         self.n_el_samples = n_el_samples
         self.scatterer_chunk_size = scatterer_chunk_size
-        self.positions = self.scan.flatgrid
-        
+        self.sound_speed_offset_scale = sound_speed_offset_scale
+        self.positions = scan.flatgrid + 2 * position_offset * (keras.random.uniform(shape=scan.flatgrid.shape, seed=42)-ops.ones_like(self.scan.flatgrid)*0.5)* scan.wavelength
+
     def img_to_magnitude(self, image, positions):
         n_frames = image.shape[0]
         image = ops.reshape(image, (n_frames, -1))
-        image = self.symlog(image)
+        image = self.symexp(image)
         mask = ops.logical_not(positions[:,2] < 0)[None, :]
         image = image * mask
         return image
@@ -352,31 +355,61 @@ class Simulator_Total(Operator):
     def symlog(self, x, epsilon=0.01):
         x_scaled = x / epsilon
         return ops.sign(x) * ops.log1p(ops.abs(x_scaled))
-
-    def reparameterize_optvars(self, scan, optvars_tree):
-        out = dict(optvars_tree)
-        out["positions"] = out.get("positions", ops.zeros_like(self.positions)) * scan.wavelength
-        out["sound_speed_offset"] = out.get("sound_speed_offset", 0.0) * scan.sound_speed
-        out["element_gains"] = out.get(
-            "element_gains",
-            ops.zeros((self.scan.n_el,), dtype="float32"),
-        ) * 1e-3
-        out["initial_times"] = out.get("initial_times", ops.zeros_like(self.scan.initial_times)) * 1e-6
-        out["attenuation_coef"] = out.get("attenuation_coef", 0.0) * 1e-3  # convert from dB/cm/MHz to dB/m/MHz
-        return out
+    
+    def symexp(self, x, epsilon=0.01):
+        a = epsilon * ops.sign(x) * (ops.exp(x) - 1)
+        return a
+    
+    def reparameterize_optvars(self, optvars):
+        """Reparameterize optimization variables.
+        
+        Only unpack and scale variables actually present in optvars to avoid
+        unnecessary tracing through unused array creations during autograd.
+        """
+        out = dict(optvars)
+        
+        # Sound speed: only recompute if present
+        if "sound_speed_offset" in out:
+            sound_speed_offset = out["sound_speed_offset"] * self.sound_speed_offset_scale
+            sound_speed = ops.maximum(self.scan.sound_speed - sound_speed_offset, 1e-6)
+        else:
+            sound_speed = self.scan.sound_speed
+        
+        wavelength = sound_speed / self.scan.center_frequency
+        
+        # Positions: only scale if present
+        positions = (
+            out["positions"] * wavelength
+            if "positions" in out
+            else self.positions
+        )
+        
+        # Element gains: only apply if present
+        element_gains = (
+            out["element_gains"] * 1e-3
+            if "element_gains" in out
+            else ops.zeros((self.scan.n_el,), dtype="float32")
+        )
+        
+        # Initial times: only apply if present
+        initial_times = (
+            out["initial_times"] * 1e-6
+            if "initial_times" in out
+            else self.scan.initial_times
+        )
+        
+        # Attenuation: only apply if present
+        attenuation_coef = (
+            out["attenuation_coef"] * 1e-3
+            if "attenuation_coef" in out
+            else 0.0
+        )
+        
+        return positions, sound_speed, attenuation_coef, element_gains, initial_times
     
     def forward(self, image, optvars, seed, **kwargs):
         assert isinstance(optvars, dict), "optvars should be a dict"
-        
-        optvars_tree = self.reparameterize_optvars(self.scan, optvars)
-        positions = self.positions + optvars_tree.get("positions", ops.zeros_like(self.positions))
-        sound_speed = self.scan.sound_speed + optvars_tree.get("sound_speed_offset", 0.0)
-        attenuation_coef = self.scan.attenuation_coef + optvars_tree.get("attenuation_coef", 0.0)
-        element_gains = ops.ones((self.scan.n_el,), dtype="float32") + optvars_tree.get(
-            "element_gains",
-            ops.zeros((self.scan.n_el,), dtype="float32"),
-        )
-        initial_times = self.scan.initial_times + optvars_tree.get("initial_times", ops.zeros_like(self.scan.initial_times))
+        positions, sound_speed, attenuation_coef, element_gains, initial_times = self.reparameterize_optvars(optvars)
 
         assert len(image.shape) == 4, "Image should have shape (B, H, W, C)"
         magnitudes = self.img_to_magnitude(image, positions)
