@@ -378,12 +378,11 @@ class Simulator_Total(Operator):
         wavelength = sound_speed / self.scan.center_frequency
         
         # Positions: only scale if present
-        positions = (
-            out["positions"] * wavelength
-            if "positions" in out
-            else self.positions
-        )
-        
+        positions = self.positions + (
+            out["position_offset"] * wavelength
+            if "position_offset" in out
+            else self.positions)
+
         # Element gains: only apply if present
         element_gains = (
             out["element_gains"] * 1e-3
@@ -399,10 +398,10 @@ class Simulator_Total(Operator):
         )
         
         # Attenuation: only apply if present
-        attenuation_coef = (
+        attenuation_coef = self.scan.attenuation_coef + (
             out["attenuation_coef"] * 1e-3
             if "attenuation_coef" in out
-            else 0.0
+            else self.scan.attenuation_coef
         )
         
         return positions, sound_speed, attenuation_coef, element_gains, initial_times
