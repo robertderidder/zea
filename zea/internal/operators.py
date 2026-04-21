@@ -335,11 +335,9 @@ class Simulator_Total(Operator):
              n_el_samples,
              scatterer_chunk_size = 256,
              position_offset_wl = 0.0,
-             sound_speed_offset_scale = 100.0,
-             start_idx = 0,):
+             sound_speed_offset_scale = 100.0,):
         super().__init__()
         self.scan = scan
-        self.scan.n_ax = self.scan.n_ax - start_idx
         self.shape = scan.grid.shape[:2]
         self.n_tx_samples = n_tx_samples
         self.n_freqs = 2**int(ops.ceil(ops.log2(self.scan.n_ax))) // 2 + 1
@@ -348,7 +346,6 @@ class Simulator_Total(Operator):
         self.scatterer_chunk_size = scatterer_chunk_size
         self.sound_speed_offset_scale = sound_speed_offset_scale
         self.positions = scan.flatgrid + 2 * position_offset_wl * (keras.random.uniform(shape=scan.flatgrid.shape, seed=42)-ops.ones_like(self.scan.flatgrid)*0.5)* scan.wavelength
-        self.start_idx = start_idx
 
     def img_to_magnitude(self, image, positions):
         n_frames = image.shape[0]
@@ -397,7 +394,7 @@ class Simulator_Total(Operator):
         )
         
         # Initial times: only apply if present
-        initial_times = self.scan.initial_times + self.start_idx / self.scan.sampling_frequency + (
+        initial_times = self.scan.initial_times + (
             out["initial_times"] * 1e-6
             if "initial_times" in out
             else ops.zeros_like(self.scan.initial_times)
