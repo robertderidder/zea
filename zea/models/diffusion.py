@@ -916,6 +916,8 @@ class DiffusionModel(DeepGenerativeModel):
         optvars_with_adam = kwargs.pop("optvars_with_adam", False)
         optvars_adam_params = kwargs.pop("optvars_adam_params", None)
 
+        with_clipping = kwargs.pop("with_clipping", False)
+
         #Check if what you are doing is making sense
         if optvars is None and isinstance(self.guidance_fn, DPS_SIM_TOT):
             raise ValueError("optvars must be provided for DPS_SIM_TOT guidance")
@@ -1002,11 +1004,13 @@ class DiffusionModel(DeepGenerativeModel):
                 )
 
                 next_noisy_images = next_noisy_images - grad_update
+                if with_clipping:
+                    next_noisy_images = ops.clip(next_noisy_images, -1.0, 1.0)
                 pred_images = pred_images - grad_update
 
                 # this new noisy image will be used in the next step
                 if verbose:
-                    progbar.update(step + 1, [("error", error)])
+                    progbar.update(step + 1, [("error", omega*error)])
 
                 self.store_progress(step, track_progress_type, next_noisy_images, pred_images)
 
@@ -1129,7 +1133,6 @@ class DiffusionModel(DeepGenerativeModel):
                     seed=seed2,
                     stochastic_sampling=stochastic_sampling,
                 )
-
                 next_noisy_images = next_noisy_images - image_grad_update
                 pred_images = pred_images - image_grad_update
 
@@ -1479,8 +1482,8 @@ class DPS_SIM(DiffusionGuidance):
         # Split complex difference into real and imaginary parts for autograd
         diff = sampled_measurements - rf_data
                 
-        # Compute L2 norm on complex-valued tensors
-        measurement_error = ops.sqrt(ops.sum(ops.real(diff)**2 + ops.imag(diff)**2))
+        # Compute L2 norm on complex-valued tensors, and normalize
+        measurement_error = ops.sqrt(ops.sum(ops.real(diff)**2 + ops.imag(diff)**2))/ops.sqrt(n_samples)
  
         return measurement_error, (pred_noises, pred_images)
 
@@ -1570,7 +1573,9 @@ class DPS_SIM_TOT(DiffusionGuidance):
         diff = sampled_measurements - rf_data
                 
         # Compute L2 norm on real-valued tensors
-        measurement_error = ops.sqrt(ops.sum(ops.real(diff)**2 + ops.imag(diff)**2))
+
+        #normalize the norm by the number of samples to keep the scale consistent across different measurement subspace sizes, which is important for stable optimization of optvars
+        measurement_error = ops.sqrt(ops.sum(ops.real(diff)**2 + ops.imag(diff)**2))/ops.sqrt(ops.prod(ops.shape(rf_data)))
 
         return measurement_error, (pred_noises, pred_images)
 

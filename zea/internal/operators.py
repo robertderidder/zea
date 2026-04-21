@@ -223,7 +223,7 @@ class Simulator(Operator):
         self.positions = self.scan.flatgrid
         self.n_freqs = 2**int(ops.ceil(ops.log2(self.scan.n_ax))) // 2 + 1
 
-    def forward(self, image, seed, **kwargs):
+    def forward(self, image, seed, freq_gaussian_probs=False):
         assert len(image.shape) == 4, "Image should have shape (B, H, W, C)"
         seed_el, seed_freq, seed_tx = split_seed(seed, 3)
         
@@ -234,15 +234,17 @@ class Simulator(Operator):
         el_random = keras.random.uniform(shape=(self.scan.n_el,), seed=seed_el)
         el_indices = ops.argsort(el_random)[:self.n_el_samples]
 
-        freq_gaussian_probs = kwargs.get("freq_gaussian_probs", False)
-        if freq_gaussian_probs:
-            freq_bins = ops.arange(self.n_freqs)
-            center_freq_bin = self.n_freqs // 2
-            sigma = self.n_freqs / 8  # Adjust sigma as needed
+        def _gaussian_probs(_):
+            freq_bins = ops.cast(ops.arange(self.n_freqs), "float32")
+            center_freq_bin = ops.cast(self.n_freqs // 2, "float32")
+            sigma = ops.cast(self.n_freqs / 8, "float32")
             gaussian_probs = ops.exp(-0.5 * ((freq_bins - center_freq_bin) / sigma) ** 2)
-            p = gaussian_probs / ops.sum(gaussian_probs)
-        else:
-            p = ops.ones(self.n_freqs) / self.n_freqs
+            return gaussian_probs / ops.sum(gaussian_probs)
+
+        def _uniform_probs(_):
+            return ops.ones((self.n_freqs,), dtype="float32") / self.n_freqs
+
+        p = jax.lax.cond(ops.cast(freq_gaussian_probs, "bool"), _gaussian_probs, _uniform_probs, None)
 
         log_probs = ops.log(ops.maximum(p, 1e-10))
         gumbel = -ops.log(-ops.log(keras.random.uniform(shape=(self.n_freqs,), seed=seed_freq)))
@@ -332,17 +334,21 @@ class Simulator_Total(Operator):
              n_freq_samples,
              n_el_samples,
              scatterer_chunk_size = 256,
-             position_offset = 0.0,
-             sound_speed_offset_scale = 100.0):
+             position_offset_wl = 0.0,
+             sound_speed_offset_scale = 100.0,
+             start_idx = 0,):
         super().__init__()
         self.scan = scan
+        self.scan.n_ax = self.scan.n_ax - start_idx
+        self.shape = scan.grid.shape[:2]
         self.n_tx_samples = n_tx_samples
         self.n_freqs = 2**int(ops.ceil(ops.log2(self.scan.n_ax))) // 2 + 1
         self.n_freq_samples = n_freq_samples
         self.n_el_samples = n_el_samples
         self.scatterer_chunk_size = scatterer_chunk_size
         self.sound_speed_offset_scale = sound_speed_offset_scale
-        self.positions = scan.flatgrid + 2 * position_offset * (keras.random.uniform(shape=scan.flatgrid.shape, seed=42)-ops.ones_like(self.scan.flatgrid)*0.5)* scan.wavelength
+        self.positions = scan.flatgrid + 2 * position_offset_wl * (keras.random.uniform(shape=scan.flatgrid.shape, seed=42)-ops.ones_like(self.scan.flatgrid)*0.5)* scan.wavelength
+        self.start_idx = start_idx
 
     def img_to_magnitude(self, image, positions):
         n_frames = image.shape[0]
@@ -381,7 +387,7 @@ class Simulator_Total(Operator):
         positions = self.positions + (
             out["position_offset"] * wavelength
             if "position_offset" in out
-            else self.positions)
+            else ops.zeros_like(self.positions))
 
         # Element gains: only apply if present
         element_gains = (
@@ -391,26 +397,29 @@ class Simulator_Total(Operator):
         )
         
         # Initial times: only apply if present
-        initial_times = (
+        initial_times = self.scan.initial_times + self.start_idx / self.scan.sampling_frequency + (
             out["initial_times"] * 1e-6
             if "initial_times" in out
-            else self.scan.initial_times
+            else ops.zeros_like(self.scan.initial_times)
         )
         
         # Attenuation: only apply if present
         attenuation_coef = self.scan.attenuation_coef + (
             out["attenuation_coef"] * 1e-3
             if "attenuation_coef" in out
-            else self.scan.attenuation_coef
+            else 0.0
         )
         
-        return positions, sound_speed, attenuation_coef, element_gains, initial_times
+        factor = out["factor"] if "factor" in out else 1.0
+        return positions, sound_speed, attenuation_coef, element_gains, initial_times, factor
     
-    def forward(self, image, optvars, seed, **kwargs):
+    def forward(self, image, optvars, seed, freq_gaussian_probs=False, **kwargs):
         assert isinstance(optvars, dict), "optvars should be a dict"
-        positions, sound_speed, attenuation_coef, element_gains, initial_times = self.reparameterize_optvars(optvars)
+        positions, sound_speed, attenuation_coef, element_gains, initial_times, factor = self.reparameterize_optvars(optvars)
+        element_gains = ops.ones((self.scan.n_el,), dtype="float32") + element_gains
 
         assert len(image.shape) == 4, "Image should have shape (B, H, W, C)"
+        image = ops.image.resize(image, self.shape, interpolation="bilinear")
         magnitudes = self.img_to_magnitude(image, positions)
 
         seed_el, seed_freq, seed_tx = split_seed(seed, 3)
@@ -419,15 +428,17 @@ class Simulator_Total(Operator):
         tx_random = keras.random.uniform(shape=(self.scan.n_tx,), seed=seed_tx)
         tx_indices = ops.argsort(tx_random)[:self.n_tx_samples] 
 
-        freq_gaussian_probs = kwargs.get("freq_gaussian_probs", False)
-        if freq_gaussian_probs:
-            freq_bins = ops.arange(self.n_freqs)
-            center_freq_bin = self.n_freqs // 2
-            sigma = self.n_freqs / 8  # Adjust sigma as needed
+        def _gaussian_probs(_):
+            freq_bins = ops.cast(ops.arange(self.n_freqs), "float32")
+            center_freq_bin = ops.cast(self.n_freqs // 2, "float32")
+            sigma = ops.cast(self.n_freqs / 8, "float32")
             gaussian_probs = ops.exp(-0.5 * ((freq_bins - center_freq_bin) / sigma) ** 2)
-            p = gaussian_probs / ops.sum(gaussian_probs)
-        else:
-            p = ops.ones(self.n_freqs) / self.n_freqs
+            return gaussian_probs / ops.sum(gaussian_probs)
+
+        def _uniform_probs(_):
+            return ops.ones((self.n_freqs,), dtype="float32") / self.n_freqs
+
+        p = jax.lax.cond(ops.cast(freq_gaussian_probs, "bool"), _gaussian_probs, _uniform_probs, None)
 
         log_probs = ops.log(ops.maximum(p, 1e-10))
         gumbel = -ops.log(-ops.log(keras.random.uniform(shape=(self.n_freqs,), seed=seed_freq)))
@@ -490,7 +501,7 @@ class Simulator_Total(Operator):
         
         _, rf_data = ops.scan(process_frame, None, magnitudes_padded)
         element_gains = ops.take(element_gains, el_indices)
-        return element_gains[None, None, :, None]*rf_data, tx_indices, freq_indices, el_indices
+        return element_gains[None, None, :, None]*rf_data*factor, tx_indices, freq_indices, el_indices
         
     def __str__(self):
         return f"Simulator_Total with {self.n_tx_samples} tx samples, {self.n_freq_samples} freq samples, and {self.n_el_samples} el samples. Optimizing auxiliary variables"
