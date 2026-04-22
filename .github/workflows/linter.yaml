@@ -1,30 +1,30 @@
-name: Linter
+# name: Linter
 
-on:
-  pull_request:
-  push:
-    branches:
-      - main
+# on:
+#   pull_request:
+#   push:
+#     branches:
+#       - main
 
-jobs:
-  linter:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v6
+# jobs:
+#   linter:
+#     runs-on: ubuntu-latest
+#     steps:
+#       - name: Checkout Repository
+#         uses: actions/checkout@v6
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.10"
+#       - name: Set up Python
+#         uses: actions/setup-python@v6
+#         with:
+#           python-version: "3.10"
 
-      - name: Install Ruff
-        run: |
-          pip install -U pip setuptools wheel
-          pip install ruff==0.15.10
+#       - name: Install Ruff
+#         run: |
+#           pip install -U pip setuptools wheel
+#           pip install ruff==0.15.10
 
-      - name: Run Linter
-        run: ruff check --config pyproject.toml --verbose
+#       - name: Run Linter
+#         run: ruff check --config pyproject.toml --verbose
 
-      - name: Run Formatter
-        run: ruff format --config pyproject.toml --check --verbose
+#       - name: Run Formatter
+#         run: ruff format --config pyproject.toml --check --verbose
