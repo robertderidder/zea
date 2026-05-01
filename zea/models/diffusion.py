@@ -982,6 +982,9 @@ class DiffusionModel(DeepGenerativeModel):
                     signal_rates=signal_rates,
                     **kwargs,
                 )
+                # if ops.any(pred_images > 1.0) or ops.any(pred_images < -1.0):
+                #     print("Warning: predicted images out of range [-1, 1], consider enabling clipping or adjusting guidance strength")
+                #     pred_images = ops.clip(pred_images, -1.0, 1.0)
 
                 if with_adam:
                     m = beta1 * m + (1 - beta1) * gradients

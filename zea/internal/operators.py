@@ -19,6 +19,7 @@ import keras
 from zea.simulator_subsample import simulate_rf
 import jax
 import jax.numpy as jnp
+from zea.display import frustum_convert_xz2rt, map_coordinates
 
 class Operator(abc.ABC, Object):
     """Operator base class.
@@ -215,22 +216,173 @@ class Simulator(Operator):
                  n_tx_samples,
                  n_freq_samples,
                  n_el_samples,
-                 scatterer_chunk_size = 256,):
+                 scatterer_chunk_size = 256,
+                 n_equidistant_beams = 0,
+                 n_random_beams = 0,
+                 grid_type = "scan",):
         super().__init__()
-        self.scan = scan
+        self.scan = self.validate_scan(scan)
         self.n_tx_samples = n_tx_samples
         self.n_freq_samples = n_freq_samples
         self.n_el_samples = n_el_samples
         self.scatterer_chunk_size = scatterer_chunk_size
-        self.positions = self.scan.flatgrid
         self.n_freqs = 2**int(ops.ceil(ops.log2(self.scan.n_ax))) // 2 + 1
+        self.beams = self.select_beams(n_equidistant_beams, n_random_beams)
+        self.grid_type = grid_type
+        if grid_type == "cone":
+            self.positions = self.cone_grid(scan)
+        elif grid_type == "scan":
+            self.positions = self.scan.flatgrid
+
+    def cone_grid(self, scan):
+        """
+        Generate a cone-shaped grid for beamforming. but the density of points is equal in the whole domain. not concentrated at the top
+        """
+        #Generate grid of points, between xlims and from apex to z_max
+        x_min, x_max = self.xlims(scan)
+        z_min, z_max = scan.zlims
+        max_angle = np.max(np.abs(scan.polar_limits))
+        t = np.tan(max_angle)
+        if np.isclose(t, 0.0):
+            t = 0.0
+        distance_to_apex = scan.distance_to_apex
+
+        if scan.pixels_per_wavelength is not None:
+            n_pix_x = (x_max - x_min)/scan.wavelength*scan.pixels_per_wavelength
+            n_pix_z = (z_max - z_min+distance_to_apex)/scan.wavelength*scan.pixels_per_wavelength
+            x = np.linspace(x_min, x_max, int(n_pix_x))
+            z = np.linspace(z_min, z_max+distance_to_apex, int(n_pix_z))
+        else:
+            x = np.linspace(x_min, x_max, scan.grid_size_x)
+            z = np.linspace(z_min, z_max+distance_to_apex, scan.grid_size_z)
+        X, Z = np.meshgrid(x, z)
+        Y = np.zeros_like(X)
+        positions = np.stack([X, Y, Z], axis=-1).reshape(-1, 3)
+
+        cone_mask = np.abs(X) <= Z * t
+        positions = positions[cone_mask.reshape(-1)]
+
+        r_mask = np.sqrt(positions[...,0]**2 + positions[...,2]**2) <= (z_max+distance_to_apex)
+        positions = positions[r_mask.reshape(-1)]
+
+        positions[...,2] -= distance_to_apex
+        positions = positions[positions[...,2] >= 0]
+        
+        return ops.convert_to_tensor(positions, dtype="float32")
+
+    def sample_image_on_positions(self, image, positions, fill_value=0.0, order=1):
+        """Sample a polar/frustum image at arbitrary cone-grid positions."""
+        if len(image.shape) != 4:
+            raise ValueError(f"Image should have shape (B, H, W, C). Got {image.shape}.")
+        if image.shape[-1] != 1:
+            raise ValueError(
+                f"Cone-grid sampling expects a single-channel image, got {image.shape[-1]} channels."
+            )
+
+        image = ops.squeeze(image, axis=-1)
+        image_shape = image.shape
+        rho_range = getattr(self.scan, "rho_range", None)
+        if rho_range is None:
+            rho_range = (self.scan.zlims[0], self.scan.zlims[1] + self.cone_distance_to_apex)
+        theta_range = getattr(self.scan, "theta_range", None)
+        if theta_range is None:
+            theta_range = self.scan.polar_limits
+
+        rho_min, rho_max = rho_range
+        theta_min, theta_max = theta_range
+
+        x = positions[:, 0]
+        z = positions[:, 2] + self.scan.distance_to_apex
+        rho, theta = frustum_convert_xz2rt(x, z, (theta_min, theta_max))
+
+        valid = (
+            (rho >= rho_min)
+            & (rho <= rho_max)
+            & (theta >= theta_min)
+            & (theta <= theta_max)
+        )
+
+        rho_idx = (rho - rho_min) / (rho_max - rho_min) * (image_shape[-2] - 1)
+        theta_idx = (theta - theta_min) / (theta_max - theta_min) * (image_shape[-1] - 1)
+
+        rho_idx = ops.where(valid, rho_idx, -1.0)
+        theta_idx = ops.where(valid, theta_idx, -1.0)
+        coordinates = ops.stack([rho_idx, theta_idx], axis=0)
+
+        def _sample_single(single_image):
+            return map_coordinates(
+                single_image,
+                coordinates,
+                order=order,
+                fill_mode="constant",
+                fill_value=fill_value,
+            )
+
+        return ops.vectorized_map(_sample_single, image)
+
+    def xlims(self,scan):
+        #To correct error in zea
+        radius = max(scan.zlims+scan.distance_to_apex)
+        xlims_polar = (
+            radius * np.cos(-np.pi / 2 + scan.polar_limits[0]),
+            radius * np.cos(-np.pi / 2 + scan.polar_limits[1]),
+        )
+        xlims_plane = (min(scan.probe_geometry[:, 0]), max(scan.probe_geometry[:, 0]))
+        xlims = (
+            min(xlims_polar[0], xlims_plane[0]),
+            max(xlims_polar[1], xlims_plane[1]),
+        )
+        return xlims
+
+    def select_beams(self, n_equidistant, n_random):
+        if n_equidistant == "all" or n_random == "all":
+            return ops.arange(self.scan.n_tx, dtype="int32")
+        
+        if n_equidistant == 0 and n_random == 0:
+            raise ValueError("At least one of n_equidistant_beams or n_random_beams must be greater than 0.")
+        if n_equidistant > 0 and n_random > 0:
+            raise ValueError("n_equidistant_beams and n_random_beams cannot both be greater than 0. Please choose one sampling strategy.")
+        if n_equidistant > 0:
+            #choose n equidistant transmits from the scan
+            beams = ops.linspace(0, self.scan.n_tx-1, n_equidistant, dtype="int32")
+        if n_random > 0:
+            #choose n random transmits from the scan
+            beams = ops.random.shuffle(ops.arange(self.scan.n_tx, dtype="int32"))[:n_random]
+        if self.n_tx_samples > len(beams):
+            raise ValueError(f"n_tx_samples ({self.n_tx_samples}) cannot be greater than the number of selected beams ({len(beams)}). Please adjust n_tx_samples or the beam selection strategy.")
+        return beams
+    
+    def validate_scan(self, scan):
+        required_attrs = ["probe_geometry","apply_lens_correction","sound_speed","lens_sound_speed",
+                          "lens_thickness","n_ax","center_frequency","sampling_frequency","t0_delays",
+                          "initial_times","element_width","attenuation_coef","tx_apodizations"]
+    
+        if not hasattr(scan, "apply_lens_correction"):
+            scan.apply_lens_correction = False  # Default to False if not provided
+            scan.lens_sound_speed = scan.sound_speed  # Default to same as sound speed
+            scan.lens_thickness = 0.0  # Default to no lens thickness
+            log.warning("Scan object missing lens correction attributes. Defaulting to no lens correction.")
+
+        if scan.apply_lens_correction is False:
+            #add these attributes, because they are probably not declared
+            scan.lens_sound_speed = scan.sound_speed
+            scan.lens_thickness = 0.0
+
+        for attr in required_attrs:
+            if not hasattr(scan, attr):
+                raise ValueError(f"Scan object is missing required attribute: {attr}")
+        return scan
 
     def forward(self, image, seed, freq_gaussian_probs=False):
         assert len(image.shape) == 4, "Image should have shape (B, H, W, C)"
         seed_el, seed_freq, seed_tx = split_seed(seed, 3)
         
         n_frames, *img_shape = image.shape
-        magnitudes = self.image_to_magnitudes(image, n_frames)
+        if self.grid_type == "cone":
+            #sample the image at the cone grid positions
+            magnitudes = self.sample_image_on_positions(image, self.positions)
+        else:
+            magnitudes = self.image_to_magnitudes(image, n_frames)
 
         #sample el, freq and tx
         el_random = keras.random.uniform(shape=(self.scan.n_el,), seed=seed_el)
@@ -253,12 +405,14 @@ class Simulator(Operator):
         freq_random = log_probs + gumbel
         freq_indices = ops.argsort(freq_random)[:self.n_freq_samples]
 
-        tx_random = keras.random.uniform(shape=(self.scan.n_tx,), seed=seed_tx)
+        tx_random = keras.random.uniform(shape=(len(self.beams),), seed=seed_tx)
         tx_indices = ops.argsort(tx_random)[:self.n_tx_samples]
 
         el_indices = ops.sort(el_indices)
         freq_indices = ops.sort(freq_indices)
         tx_indices = ops.sort(tx_indices)
+
+        tx_indices = ops.take(self.beams, tx_indices)
 
         # Compute scatterer padding for chunking
         n_scat = self.positions.shape[0]
@@ -558,7 +712,9 @@ class Simulator_GD(Operator):
              n_el_samples,
              scatterer_chunk_size = 256,
              n_equidistant_beams = 0,
-             n_random_beams = 0,):
+             n_random_beams = 0,
+             grid_type = 'scan',
+             ax_min = 0):
         super().__init__()
         self.scan = self.validate_scan(scan)
         self.shape = scan.grid.shape[:2]
@@ -568,12 +724,18 @@ class Simulator_GD(Operator):
         self.n_el_samples = n_el_samples
         self.scatterer_chunk_size = scatterer_chunk_size
         
-        self.base_positions = self.scan.flatgrid
         self.base_sound_speed = jnp.asarray(self.scan.sound_speed, dtype=jnp.float32)
-        self.base_initial_times = jnp.asarray(self.scan.initial_times, dtype=jnp.float32)
+        self.base_initial_times = jnp.asarray(self.scan.initial_times, dtype=jnp.float32)+ax_min/self.scan.sampling_frequency
         self.base_attenuation_coef = jnp.asarray(self.scan.attenuation_coef, dtype=jnp.float32)
         
         self.beams = self.select_beams(n_equidistant_beams, n_random_beams)
+        self.grid_type = grid_type
+        self.ax_min = ax_min
+        if grid_type == 'scan':
+            self.base_positions = self.scan.flatgrid
+        elif grid_type == "cone":
+            self.cone_distance_to_apex = scan.distance_to_apex
+            self.base_positions = self.cone_grid(scan)
 
     def validate_scan(self, scan):
         required_attrs = ["probe_geometry","apply_lens_correction","sound_speed","lens_sound_speed",
@@ -595,6 +757,106 @@ class Simulator_GD(Operator):
                 raise ValueError(f"Scan object is missing required attribute: {attr}")
         return scan
     
+    def cone_grid(self, scan):
+        """
+        Generate a cone-shaped grid for beamforming. but the density of points is equal in the whole domain. not concentrated at the top
+        """
+        #Generate grid of points, between xlims and from apex to z_max
+        x_min, x_max = self.xlims(scan)
+        z_min, z_max = scan.zlims
+        max_angle = np.max(np.abs(scan.polar_limits))
+        t = np.tan(max_angle)
+        if np.isclose(t, 0.0):
+            t = 0.0
+        distance_to_apex = scan.distance_to_apex
+
+        if scan.pixels_per_wavelength is not None:
+            n_pix_x = (x_max - x_min)/scan.wavelength*scan.pixels_per_wavelength
+            n_pix_z = (z_max - z_min+distance_to_apex)/scan.wavelength*scan.pixels_per_wavelength
+            x = np.linspace(x_min, x_max, int(n_pix_x))
+            z = np.linspace(z_min, z_max+distance_to_apex, int(n_pix_z))
+        else:
+            x = np.linspace(x_min, x_max, scan.grid_size_x)
+            z = np.linspace(z_min, z_max+distance_to_apex, scan.grid_size_z)
+        X, Z = np.meshgrid(x, z)
+        Y = np.zeros_like(X)
+        positions = np.stack([X, Y, Z], axis=-1).reshape(-1, 3)
+
+        cone_mask = np.abs(X) <= Z * t
+        positions = positions[cone_mask.reshape(-1)]
+
+        r_mask = np.sqrt(positions[...,0]**2 + positions[...,2]**2) <= (z_max+distance_to_apex)
+        positions = positions[r_mask.reshape(-1)]
+
+        positions[...,2] -= distance_to_apex
+        positions = positions[positions[...,2] >= 0]
+        
+        return ops.convert_to_tensor(positions, dtype="float32")
+
+    def sample_image_on_positions(self, image, positions, fill_value=0.0, order=1):
+        """Sample a polar/frustum image at arbitrary cone-grid positions."""
+        if len(image.shape) != 4:
+            raise ValueError(f"Image should have shape (B, H, W, C). Got {image.shape}.")
+        if image.shape[-1] != 1:
+            raise ValueError(
+                f"Cone-grid sampling expects a single-channel image, got {image.shape[-1]} channels."
+            )
+
+        image = ops.squeeze(image, axis=-1)
+        image_shape = image.shape
+        rho_range = getattr(self.scan, "rho_range", None)
+        if rho_range is None:
+            rho_range = (self.scan.zlims[0], self.scan.zlims[1] + self.cone_distance_to_apex)
+        theta_range = getattr(self.scan, "theta_range", None)
+        if theta_range is None:
+            theta_range = self.scan.polar_limits
+
+        rho_min, rho_max = rho_range
+        theta_min, theta_max = theta_range
+
+        x = positions[:, 0]
+        z = positions[:, 2] + self.cone_distance_to_apex
+        rho, theta = frustum_convert_xz2rt(x, z, (theta_min, theta_max))
+
+        valid = (
+            (rho >= rho_min)
+            & (rho <= rho_max)
+            & (theta >= theta_min)
+            & (theta <= theta_max)
+        )
+
+        rho_idx = (rho - rho_min) / (rho_max - rho_min) * (image_shape[-2] - 1)
+        theta_idx = (theta - theta_min) / (theta_max - theta_min) * (image_shape[-1] - 1)
+
+        rho_idx = ops.where(valid, rho_idx, -1.0)
+        theta_idx = ops.where(valid, theta_idx, -1.0)
+        coordinates = ops.stack([rho_idx, theta_idx], axis=0)
+
+        def _sample_single(single_image):
+            return map_coordinates(
+                single_image,
+                coordinates,
+                order=order,
+                fill_mode="constant",
+                fill_value=fill_value,
+            )
+
+        return ops.vectorized_map(_sample_single, image)
+
+    def xlims(scan):
+        #To correct error in zea
+        radius = max(scan.zlims+scan.distance_to_apex)
+        xlims_polar = (
+            radius * np.cos(-np.pi / 2 + scan.polar_limits[0]),
+            radius * np.cos(-np.pi / 2 + scan.polar_limits[1]),
+        )
+        xlims_plane = (min(scan.probe_geometry[:, 0]), max(scan.probe_geometry[:, 0]))
+        xlims = (
+            min(xlims_polar[0], xlims_plane[0]),
+            max(xlims_polar[1], xlims_plane[1]),
+        )
+        return xlims
+
     def select_beams(self, n_equidistant, n_random):
         if n_equidistant == "all" or n_random == "all":
             return ops.arange(self.scan.n_tx, dtype="int32")
@@ -678,7 +940,10 @@ class Simulator_GD(Operator):
 
         assert len(image.shape) == 4, "Image should have shape (B, H, W, C)"
         n_frames, *img_shape = image.shape
-        magnitudes = ops.reshape(image, (n_frames, -1))
+        if self.grid_type == "cone":
+            magnitudes = self.sample_image_on_positions(image, positions)
+        else:
+            magnitudes = ops.reshape(image, (n_frames, -1))
 
         seed_el, seed_freq, seed_tx = split_seed(seed, 3)
 
