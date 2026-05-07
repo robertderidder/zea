@@ -543,7 +543,7 @@ class Simulator_Total(Operator):
     def img_to_magnitude(self, image, positions):
         n_frames = image.shape[0]
         image = ops.reshape(image, (n_frames, -1))
-        image = self.symexp(image)
+        image = self.symlog(image)
         mask = ops.logical_not(positions[:,2] < 0)[None, :]
         image = image * mask
         return image
