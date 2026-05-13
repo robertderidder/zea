@@ -279,13 +279,12 @@ def attenuate(f, attenuation_coef, dist):
     return ops.exp(-ops.log(10) * attenuation_coef / 20 * dist * 100 * ops.abs(f) * 1e-6)
 
 
-def spread(dist, mindist=1e-3):
+def spread(dist, mindist=1e-4):
     """Function modeling geometric spreading of the wavefront.
 
     Args:
         dist (array-like): The distance the wave has traveled.
         mindist (float): The minimum distance to prevent division by zero.
-                        Default 1e-3 to handle scatterers near probe surface.
 
     Returns:
         array-like: The geometric spreading factor of same shape as `dist`.

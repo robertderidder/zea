@@ -337,17 +337,19 @@ class Simulator(Operator):
     def select_beams(self, n_equidistant, n_random):
         if n_equidistant == "all" or n_random == "all":
             return ops.arange(self.scan.n_tx, dtype="int32")
-        
-        if n_equidistant == 0 and n_random == 0:
+        elif n_equidistant == 0 and n_random == 0:
             raise ValueError("At least one of n_equidistant_beams or n_random_beams must be greater than 0.")
-        if n_equidistant > 0 and n_random > 0:
+        elif n_equidistant > 0 and n_random > 0:
             raise ValueError("n_equidistant_beams and n_random_beams cannot both be greater than 0. Please choose one sampling strategy.")
-        if n_equidistant > 0:
+        elif n_equidistant > 0:
             #choose n equidistant transmits from the scan
             beams = ops.linspace(0, self.scan.n_tx-1, n_equidistant, dtype="int32")
-        if n_random > 0:
+        elif n_random > 0:
             #choose n random transmits from the scan
             beams = ops.random.shuffle(ops.arange(self.scan.n_tx, dtype="int32"))[:n_random]
+        else:
+            raise ValueError("Invalid beam selection strategy. Please check n_equidistant_beams and n_random_beams parameters.")
+        
         if self.n_tx_samples > len(beams):
             raise ValueError(f"n_tx_samples ({self.n_tx_samples}) cannot be greater than the number of selected beams ({len(beams)}). Please adjust n_tx_samples or the beam selection strategy.")
         return beams
@@ -372,18 +374,34 @@ class Simulator(Operator):
             if not hasattr(scan, attr):
                 raise ValueError(f"Scan object is missing required attribute: {attr}")
         return scan
+    
+
+    def image_to_magnitudes(self, image, n_frames):
+        image = translate(image, range_from=(-1,1), range_to=self.scan.dynamic_range)
+        image_lin = 10**(image/20)  # convert from dB to linear scale
+        image_lin = ops.reshape(image_lin, (n_frames, -1))
+        #set magnitudes of pixels z<0 to 0r
+        mask = ops.logical_not(self.positions[:,2] < 0)[None, :]
+        image_lin = image_lin * mask
+        return image_lin
+
+    def reparam_amps(self, x, epsilon=0.01):
+        x_scaled = x / epsilon
+        return ops.sign(x) * ops.log1p(ops.abs(x_scaled))
 
     def forward(self, image, seed, freq_gaussian_probs=False):
         assert len(image.shape) == 4, "Image should have shape (B, H, W, C)"
         seed_el, seed_freq, seed_tx = split_seed(seed, 3)
         
         n_frames, *img_shape = image.shape
-        if self.grid_type == "cone":
-            #sample the image at the cone grid positions
-            magnitudes = self.sample_image_on_positions(image, self.positions)
-        else:
-            magnitudes = self.image_to_magnitudes(image, n_frames)
+        # if self.grid_type == "cone":
+        #     #sample the image at the cone grid positions
+        #     magnitudes = self.sample_image_on_positions(image, self.positions)
+        # else:
+        #     magnitudes = self.image_to_magnitudes(image, n_frames)
 
+        magnitudes = ops.reshape(image, (n_frames, -1))
+        magnitudes = self.reparam_amps(magnitudes)
         #sample el, freq and tx
         el_random = keras.random.uniform(shape=(self.scan.n_el,), seed=seed_el)
         el_indices = ops.argsort(el_random)[:self.n_el_samples]
@@ -413,7 +431,7 @@ class Simulator(Operator):
         tx_indices = ops.sort(tx_indices)
 
         tx_indices = ops.take(self.beams, tx_indices)
-
+        tx_indices = ops.array([95])
         # Compute scatterer padding for chunking
         n_scat = self.positions.shape[0]
         chunk_size = self.scatterer_chunk_size
@@ -464,15 +482,6 @@ class Simulator(Operator):
         _, rf_data = ops.scan(process_frame, None, magnitudes_padded)
 
         return rf_data, tx_indices, freq_indices, el_indices
-
-    def image_to_magnitudes(self, image, n_frames):
-        image = translate(image, range_from=(-1,1), range_to=self.scan.dynamic_range)
-        image_lin = 10**(image/20)  # convert from dB to linear scale
-        image_lin = ops.reshape(image_lin, (n_frames, -1))
-        #set magnitudes of pixels z<0 to 0r
-        mask = ops.logical_not(self.positions[:,2] < 0)[None, :]
-        image_lin = image_lin * mask
-        return image_lin
 
     def __str__(self):
         return f"Simulator with {self.n_tx_samples} tx samples, {self.n_freq_samples} freq samples, and {self.n_el_samples} el samples. Not optimizing auxiliary variables."
