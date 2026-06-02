@@ -910,6 +910,7 @@ class DiffusionModel(DeepGenerativeModel):
 
         with_adam = kwargs.pop("with_adam", False)
         adam_params = kwargs.pop("adam_params", None)
+        no_rev_diffusion = kwargs.pop("no_rev_diffusion", False)
 
         optvars = kwargs.pop("optvars", None)
         omega_optvars = kwargs.pop("omega_optvars", omega)
@@ -995,16 +996,19 @@ class DiffusionModel(DeepGenerativeModel):
                 else:
                     grad_update = omega * gradients
 
-                next_noisy_images = self.reverse_diffusion_step(
-                    shape=(num_images, *input_shape),
-                    pred_images=pred_images,
-                    pred_noises=pred_noises,
-                    signal_rates=signal_rates,
-                    next_signal_rates=next_signal_rates,
-                    next_noise_rates=next_noise_rates,
-                    seed=seed2,
-                    stochastic_sampling=stochastic_sampling,
-                )
+                if no_rev_diffusion:
+                    next_noisy_images = noisy_images - grad_update
+                else:
+                    next_noisy_images = self.reverse_diffusion_step(
+                        shape=(num_images, *input_shape),
+                        pred_images=pred_images,
+                        pred_noises=pred_noises,
+                        signal_rates=signal_rates,
+                        next_signal_rates=next_signal_rates,
+                        next_noise_rates=next_noise_rates,
+                        seed=seed2,
+                        stochastic_sampling=stochastic_sampling,
+                    )
 
                 next_noisy_images = next_noisy_images - grad_update
                 if with_clipping:
