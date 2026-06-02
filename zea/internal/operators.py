@@ -421,7 +421,8 @@ class Simulator(Operator):
         log_probs = ops.log(ops.maximum(p, 1e-10))
         gumbel = -ops.log(-ops.log(keras.random.uniform(shape=(self.n_freqs,), seed=seed_freq)))
         freq_random = log_probs + gumbel
-        freq_indices = ops.argsort(freq_random)[:self.n_freq_samples]
+        # Gumbel top-k sampling: pick largest scores, not smallest.
+        freq_indices = ops.argsort(freq_random)[-self.n_freq_samples:]
 
         tx_random = keras.random.uniform(shape=(len(self.beams),), seed=seed_tx)
         tx_indices = ops.argsort(tx_random)[:self.n_tx_samples]
@@ -431,7 +432,6 @@ class Simulator(Operator):
         tx_indices = ops.sort(tx_indices)
 
         tx_indices = ops.take(self.beams, tx_indices)
-        tx_indices = ops.array([95])
         # Compute scatterer padding for chunking
         n_scat = self.positions.shape[0]
         chunk_size = self.scatterer_chunk_size
@@ -469,7 +469,7 @@ class Simulator(Operator):
         @jax.checkpoint
         def accumulate_chunks(rf_accumulated, chunk):
             pos_chunk, mag_chunk = chunk
-            rf_accumulated += simulate_chunk(pos_chunk, mag_chunk)
+            rf_accumulated = rf_accumulated + simulate_chunk(pos_chunk, mag_chunk)
             return rf_accumulated, None
 
         @jax.checkpoint
@@ -644,7 +644,8 @@ class Simulator_Total(Operator):
         log_probs = ops.log(ops.maximum(p, 1e-10))
         gumbel = -ops.log(-ops.log(keras.random.uniform(shape=(self.n_freqs,), seed=seed_freq)))
         freq_random = log_probs + gumbel
-        freq_indices = ops.argsort(freq_random)[:self.n_freq_samples]
+        # Gumbel top-k sampling: pick largest scores, not smallest.
+        freq_indices = ops.argsort(freq_random)[-self.n_freq_samples:]
 
         el_random = keras.random.uniform(shape=(self.scan.n_el,), seed=seed_el)
         el_indices = ops.argsort(el_random)[:self.n_el_samples]
@@ -690,7 +691,7 @@ class Simulator_Total(Operator):
         @jax.checkpoint
         def accumulate_chunks(rf_accumulated, chunk):
             scat_chunk, amp_chunk = chunk
-            rf_accumulated += simulate_chunk(scat_chunk, amp_chunk)
+            rf_accumulated = rf_accumulated + simulate_chunk(scat_chunk, amp_chunk)
             return rf_accumulated, None
 
         @jax.checkpoint
@@ -898,7 +899,8 @@ class Simulator_GD(Operator):
         if "sound_speed_abs" in out:
             sound_speed = ops.cast(out["sound_speed_abs"], "float32")
         elif "sound_speed_offset" in out:
-            sound_speed = ops.cast(self.base_sound_speed - out["sound_speed_offset"], "float32")
+            # Positive offset should increase sound speed, matching caller parameterization.
+            sound_speed = ops.cast(self.base_sound_speed + out["sound_speed_offset"], "float32")
         else:
             sound_speed = self.base_sound_speed
         sound_speed = ops.maximum(sound_speed, 1e-6)
@@ -977,7 +979,8 @@ class Simulator_GD(Operator):
         log_probs = ops.log(ops.maximum(p, 1e-10))
         gumbel = -ops.log(-ops.log(keras.random.uniform(shape=(self.n_freqs,), seed=seed_freq)))
         freq_random = log_probs + gumbel
-        freq_indices = ops.argsort(freq_random)[:self.n_freq_samples]
+        # Gumbel top-k sampling: pick largest scores, not smallest.
+        freq_indices = ops.argsort(freq_random)[-self.n_freq_samples:]
 
         el_random = keras.random.uniform(shape=(self.scan.n_el,), seed=seed_el)
         el_indices = ops.argsort(el_random)[:self.n_el_samples]
@@ -1023,7 +1026,7 @@ class Simulator_GD(Operator):
         @jax.checkpoint
         def accumulate_chunks(rf_accumulated, chunk):
             scat_chunk, amp_chunk = chunk
-            rf_accumulated += simulate_chunk(scat_chunk, amp_chunk)
+            rf_accumulated = rf_accumulated + simulate_chunk(scat_chunk, amp_chunk)
             return rf_accumulated, None
 
         @jax.checkpoint
@@ -1036,6 +1039,149 @@ class Simulator_GD(Operator):
         _, rf_data = ops.scan(process_frame, None, magnitudes_padded)
         element_gains = ops.take(element_gains, el_indices)
         return element_gains[None, None, None, :, None]*rf_data*factor, tx_indices, freq_indices, el_indices
+        
+    def __str__(self):
+        return f"Simulator_GD with {self.n_tx_samples} tx samples, {self.n_freq_samples} freq samples, and {self.n_el_samples} el samples. Optimizing auxiliary variables"
+    
+    def transpose(self, data, *args, **kwargs):
+        raise NotImplementedError("Transpose not implemented for Simulator_GD operator.")   
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+class Simulator_Final_V5(Operator):
+    """ Simulator that optimizes other auxiliary variables. 
+    This may not depend on the dynamic range, because that is a visualization parameter, not part of the forward model """
+
+    def __init__(self,
+             scan,
+             data_dict,
+             n_tx_samples,
+             n_freq_samples,
+             n_el_samples,
+             scatterer_chunk_size = 2048,):
+        super().__init__()
+        self.scan = self.validate_scan(scan)
+        self.data_dict = data_dict
+        self.n_tx_samples = n_tx_samples
+        self.n_freqs = 2**int(ops.ceil(ops.log2(self.scan.n_ax))) // 2 + 1
+        self.n_freq_samples = n_freq_samples
+        self.n_el_samples = n_el_samples
+        self.scatterer_chunk_size = scatterer_chunk_size
+        self.beams = jnp.asarray(self.scan.selected_transmits)
+
+    def validate_scan(self, scan):
+        required_attrs = ["probe_geometry","apply_lens_correction","sound_speed","lens_sound_speed",
+                          "lens_thickness","n_ax","center_frequency","sampling_frequency","t0_delays",
+                          "initial_times","element_width","attenuation_coef","tx_apodizations"]
+    
+        if not hasattr(scan, "apply_lens_correction"):
+            scan.apply_lens_correction = False  # Default to False if not provided
+            log.warning("Scan object missing lens correction attributes. Defaulting to no lens correction.")
+        if not hasattr(scan, "lens_sound_speed"):
+            scan.lens_sound_speed = scan.sound_speed  # Default to same as sound speed
+            log.warning("Scan object missing lens_sound_speed attribute. Defaulting to same as sound_speed.")
+        if not hasattr(scan, "lens_thickness"):
+            scan.lens_thickness = 0.0  # Default to no lens thickness
+            log.warning("Scan object missing lens_thickness attribute. Defaulting to 0.0 (no lens).")
+            
+        for attr in required_attrs:
+            if not hasattr(scan, attr):
+                raise ValueError(f"Scan object is missing required attribute: {attr}")
+        return scan
+        
+    def forward(self, positions, magnitudes, sound_speed, seed):
+        seed_el, seed_freq, seed_tx = split_seed(seed, 3)
+
+        #sample el, freq and tx
+        #randomly select n beams from self.beams
+        tx_random = keras.random.uniform(shape=(self.beams.shape[0],), seed=seed_tx)
+        tx_indices = ops.argsort(tx_random)[:self.n_tx_samples]
+
+        def _gaussian_probs(_):
+            freq_bins = ops.cast(ops.arange(self.n_freqs), "float32")
+            center_freq_bin = ops.cast(self.n_freqs // 2, "float32")
+            sigma = ops.cast(self.n_freqs / 8, "float32")
+            gaussian_probs = ops.exp(-0.5 * ((freq_bins - center_freq_bin) / sigma) ** 2)
+            return gaussian_probs / ops.sum(gaussian_probs)
+
+        def _uniform_probs(_):
+            return ops.ones((self.n_freqs,), dtype="float32") / self.n_freqs
+
+        p = jax.lax.cond(ops.cast(self.data_dict["freq_gaussian_probs"], "bool"), _gaussian_probs, _uniform_probs, None)
+
+        log_probs = ops.log(ops.maximum(p, 1e-10))
+        gumbel = -ops.log(-ops.log(keras.random.uniform(shape=(self.n_freqs,), seed=seed_freq)))
+        freq_random = log_probs + gumbel
+        # Gumbel top-k sampling: pick largest scores, not smallest.
+        freq_indices = ops.argsort(freq_random)[-self.n_freq_samples:]
+
+        el_random = keras.random.uniform(shape=(self.scan.n_el,), seed=seed_el)
+        el_indices = ops.argsort(el_random)[:self.n_el_samples]
+
+        tx_indices = ops.sort(tx_indices)
+        freq_indices = ops.sort(freq_indices)
+        el_indices = ops.sort(el_indices)
+
+        # Compute scatterer padding for chunking
+        n_scat = positions.shape[0]
+        chunk_size = self.scatterer_chunk_size
+        n_scat_padded = n_scat + (chunk_size - (n_scat % chunk_size)) % chunk_size
+        n_chunks = n_scat_padded // chunk_size  
+
+        #pad and reshape positions and magnitudes for chunking
+        positions = ops.pad(positions, ((0, n_scat_padded - n_scat), (0, 0)))
+        position_chunks = ops.reshape(positions, (n_chunks, chunk_size, 3))
+        magnitudes_padded = ops.pad(magnitudes, ((0, 0), (0, n_scat_padded - n_scat)))
+
+        def simulate_chunk(pos_chunk, amp_chunk):
+            """Simulate RF for a single scatterer chunk."""
+            return simulate_rf(
+                scatterer_positions=pos_chunk,
+                scatterer_magnitudes=amp_chunk,
+                sound_speed=sound_speed,
+                el_indices=el_indices,
+                freq_indices=freq_indices,
+                tx_indices=tx_indices,
+                probe_geometry=self.data_dict["probe_geometry"],
+                apply_lens_correction=self.scan.apply_lens_correction,
+                lens_sound_speed=self.scan.lens_sound_speed,
+                lens_thickness=self.scan.lens_thickness,
+                n_ax=self.data_dict["n_ax"],
+                center_frequency=self.data_dict["center_frequency"],
+                sampling_frequency=self.data_dict["sampling_frequency"],
+                t0_delays=self.data_dict["t0_delays"],
+                initial_times=self.data_dict["initial_times"]+1/self.data_dict["sampling_frequency"]*self.data_dict["ax_min"],
+                element_width=self.data_dict["element_width"],
+                attenuation_coef=self.data_dict["attenuation_coef"],
+                tx_apodizations=self.data_dict["tx_apodizations"],
+            )
+        
+        @jax.checkpoint
+        def accumulate_chunks(rf_accumulated, chunk):
+            pos_chunk, amp_chunk = chunk
+            rf_accumulated = rf_accumulated + simulate_chunk(pos_chunk, amp_chunk)
+            return rf_accumulated, None
+
+        @jax.checkpoint
+        def process_frame(carry, frame_data):
+            magnitude_chunks = ops.reshape(frame_data, (n_chunks, chunk_size))
+            rf_init = ops.zeros((self.n_tx_samples, self.n_freq_samples, self.n_el_samples, 1), dtype='complex64')
+            rf_accumulated, _ = ops.scan(accumulate_chunks, rf_init, (position_chunks, magnitude_chunks))
+            return carry, rf_accumulated
+        
+        _, rf_data = ops.scan(process_frame, None, magnitudes_padded)
+        return rf_data, tx_indices, freq_indices, el_indices
         
     def __str__(self):
         return f"Simulator_GD with {self.n_tx_samples} tx samples, {self.n_freq_samples} freq samples, and {self.n_el_samples} el samples. Optimizing auxiliary variables"
