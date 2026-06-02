@@ -61,6 +61,20 @@ augmented_camus_seg_presets = {
     },
 }
 
+speckle2self_presets = {
+    "speckle2self-invivo": {
+        "metadata": {
+            "description": (
+                "Speckle2Self speckle reduction model trained on in-vivo ultrasound data. "
+                "Original paper and code: https://arxiv.org/abs/2507.06828"
+            ),
+            "params": 3_910_785,
+            "path": "speckle2self",
+        },
+        "hf_handle": "hf://zeahub/speckle2self-invivo",
+    },
+}
+
 regional_quality_presets = {
     "mobilenetv2_regional_quality": {
         "metadata": {
@@ -120,7 +134,7 @@ diffusion_model_presets = {
     "diffusion-echonet-dynamic": {
         "metadata": {
             "description": ("Diffusion model trained on EchoNet-Dynamic dataset."),
-            "params": 0,
+            "params": 1_953_377,
             "path": "diffusion",
         },
         "hf_handle": "hf://zeahub/diffusion-echonet-dynamic",
@@ -128,10 +142,46 @@ diffusion_model_presets = {
     "diffusion-echonetlvh-3-frame": {
         "metadata": {
             "description": ("3-frame diffusion model trained on EchoNetLVH dataset."),
-            "params": 0,
+            "params": 1_953_507,
             "path": "diffusion",
         },
         "hf_handle": "hf://zeahub/diffusion-echonetlvh",
+    },
+    "diffusion-dehazingecho2025": {
+        "metadata": {
+            "description": (
+                "Diffusion model trained on dehazingEcho2025 dataset for ultrasound dehazing. "
+                "Trained on 256x256 resolution images."
+            ),
+            "params": 7_807_750,
+            "path": "diffusion",
+        },
+        "hf_handle": "hf://tristan-deep/semantic-diffusion-echo-dehazing",
+    },
+}
+
+flow_matching_presets = {
+    "flowmatching-echonetlvh": {
+        "metadata": {
+            "description": (
+                "Flow matching model trained on EchoNetLVH dataset. "
+                "Single-channel (grayscale) model, input shape (256, 256, 1)."
+            ),
+            "params": 7_691_393,
+            "path": "flow_matching",
+        },
+        "hf_handle": "hf://zeahub/flowmatching-echonetlvh/1ch",
+    },
+    "flowmatching-echonetlvh-3ch": {
+        "metadata": {
+            "description": (
+                "Flow matching model trained on EchoNetLVH dataset. "
+                "3-frame model, input shape (256, 256, 3)."
+            ),
+            "params": 7_691_651,
+            "path": "flow_matching",
+        },
+        "hf_handle": "hf://zeahub/flowmatching-echonetlvh/3ch",
     },
 }
 
