@@ -303,8 +303,8 @@ def simulate_partial_rf_data(
             jnp.array: The rf data of shape `(batch_size, n_selected_tx, n_ax, n_el, 1)`
         """
 
-    if verbose:
-        log.warning("Verbose is not supported in the JAX implementation of simulate_partial_rf_data. Ignoring verbose flag.")
+    # if verbose:
+        # log.warning("Verbose is not supported in the JAX implementation of simulate_partial_rf_data. Ignoring verbose flag.")
     # Selection of transmit parameters
     selected_t0_delays = jnp.take(t0_delays, tx_indices, axis=0)
     selected_apodizations = jnp.take(tx_apodizations, tx_indices, axis=0)

@@ -16,7 +16,7 @@ from zea.internal.registry import operator_registry
 from zea.func.tensor import split_seed, translate
 from zea import log
 import keras
-from zea.simulator_subsample import simulate_rf
+from zea.simulator_fourier import simulate_rf
 import jax
 import jax.numpy as jnp
 from zea.display import frustum_convert_xz2rt, map_coordinates
@@ -269,10 +269,83 @@ class LinearInterpOperator(Operator):
     def __str__(self):
         return "y = (1-α)x + αh"
 
+
+def _validate_scan(scan):
+    """Validate a scan object and fill in lens-correction defaults.
+
+    Shared between `Simulator` and `Simulator_Total` so that both operators see
+    identical `lens_sound_speed` / `lens_thickness` values for the same scan.
+    """
+    required_attrs = ["probe_geometry","apply_lens_correction","sound_speed","lens_sound_speed",
+                      "lens_thickness","n_ax","center_frequency","sampling_frequency","t0_delays",
+                      "initial_times","element_width","attenuation_coef","tx_apodizations"]
+
+    if not hasattr(scan, "apply_lens_correction"):
+        scan.apply_lens_correction = False  # Default to False if not provided
+        scan.lens_sound_speed = scan.sound_speed  # Default to same as sound speed
+        scan.lens_thickness = 0.0  # Default to no lens thickness
+        log.warning("Scan object missing lens correction attributes. Defaulting to no lens correction.")
+
+    if scan.apply_lens_correction is False:
+        #add these attributes, because they are probably not declared
+        scan.lens_sound_speed = scan.sound_speed
+        scan.lens_thickness = 0.0
+
+    for attr in required_attrs:
+        if not hasattr(scan, attr):
+            #get all missing attributes and raise them in one error message
+            missing_attrs = [attr for attr in required_attrs if not hasattr(scan, attr)]
+            raise ValueError(f"Scan object is missing required attributes: {missing_attrs}")
+    return scan
+
+
+def _sample_indices(n_el, n_freqs, beams, n_tx_samples, n_freq_samples, n_el_samples,
+                     seed_el, seed_freq, seed_tx, freq_gaussian_probs):
+    """Sample element, frequency and transmit indices.
+
+    Shared between `Simulator` and `Simulator_Total` so both operators sample
+    identical indices given the same seeds.
+    """
+    el_random = keras.random.uniform(shape=(n_el,), seed=seed_el)
+    el_indices = ops.argsort(el_random)[:n_el_samples]
+
+    def _gaussian_probs(_):
+        freq_bins = ops.cast(ops.arange(n_freqs), "float32")
+        center_freq_bin = ops.cast(n_freqs // 2, "float32")
+        sigma = ops.cast(n_freqs / 8, "float32")
+        gaussian_probs = ops.exp(-0.5 * ((freq_bins - center_freq_bin) / sigma) ** 2)
+        return gaussian_probs / ops.sum(gaussian_probs)
+
+    def _uniform_probs(_):
+        return ops.ones((n_freqs,), dtype="float32") / n_freqs
+
+    p = jax.lax.cond(ops.cast(freq_gaussian_probs, "bool"), _gaussian_probs, _uniform_probs, None)
+
+    log_probs = ops.log(ops.maximum(p, 1e-10))
+    gumbel = -ops.log(-ops.log(keras.random.uniform(shape=(n_freqs,), seed=seed_freq)))
+    freq_random = log_probs + gumbel
+    freq_indices = ops.argsort(freq_random)[-n_freq_samples:]
+
+    tx_random = keras.random.uniform(shape=(len(beams),), seed=seed_tx)
+    tx_indices = ops.argsort(tx_random)[:n_tx_samples]
+
+    el_indices = ops.sort(el_indices)
+    freq_indices = ops.sort(freq_indices)
+    tx_indices = ops.sort(tx_indices)
+
+    tx_indices = ops.take(beams, tx_indices)
+    return el_indices, freq_indices, tx_indices
+
+
 class Simulator(Operator):
     """
-    Simulator opeator class. This simulates rf data given an image. 
-    The simulation is done by converting each pixel into a scatter point
+    Simulator operator. This consists of 2 steps:
+    - Converting image into scatter poitns
+    - Simulating RF data from scatter points. 
+    To speed up DPS, only a few indices are chosen per axis. They are also returned.
+
+    The scan object contains all parameters of the forward model. 
+    In case we want to choose from the same transmits for each image, we can set n_equidistant_beams or n_random_beams to a non-zero value.
     """
     def __init__(self,
                  scan,
@@ -282,122 +355,24 @@ class Simulator(Operator):
                  scatterer_chunk_size = 256,
                  n_equidistant_beams = 0,
                  n_random_beams = 0,
-                 grid_type = "scan",):
+                 grid = None,
+                 n_ax_min = 0):
         super().__init__()
         self.scan = self.validate_scan(scan)
-        self.n_tx_samples = n_tx_samples
-        self.n_freq_samples = n_freq_samples
-        self.n_el_samples = n_el_samples
+        self.n_tx_samples = scan.n_tx if n_tx_samples is None else n_tx_samples
+        self.n_freqs = 2**int(ops.ceil(ops.log2(self.scan.n_ax-n_ax_min))) // 2 + 1
+        self.n_freq_samples = self.n_freqs if n_freq_samples is None else n_freq_samples
+        self.n_el_samples = scan.n_el if n_el_samples is None else n_el_samples
         self.scatterer_chunk_size = scatterer_chunk_size
-        self.n_freqs = 2**int(ops.ceil(ops.log2(self.scan.n_ax))) // 2 + 1
         self.beams = self.select_beams(n_equidistant_beams, n_random_beams)
-        self.grid_type = grid_type
-        if grid_type == "cone":
-            self.positions = self.cone_grid(scan)
-        elif grid_type == "scan":
-            self.positions = self.scan.flatgrid
-
-    def cone_grid(self, scan):
-        """
-        Generate a cone-shaped grid for beamforming. but the density of points is equal in the whole domain. not concentrated at the top
-        """
-        #Generate grid of points, between xlims and from apex to z_max
-        x_min, x_max = self.xlims(scan)
-        z_min, z_max = scan.zlims
-        max_angle = np.max(np.abs(scan.polar_limits))
-        t = np.tan(max_angle)
-        if np.isclose(t, 0.0):
-            t = 0.0
-        distance_to_apex = scan.distance_to_apex
-
-        if scan.pixels_per_wavelength is not None:
-            n_pix_x = (x_max - x_min)/scan.wavelength*scan.pixels_per_wavelength
-            n_pix_z = (z_max - z_min+distance_to_apex)/scan.wavelength*scan.pixels_per_wavelength
-            x = np.linspace(x_min, x_max, int(n_pix_x))
-            z = np.linspace(z_min, z_max+distance_to_apex, int(n_pix_z))
-        else:
-            x = np.linspace(x_min, x_max, scan.grid_size_x)
-            z = np.linspace(z_min, z_max+distance_to_apex, scan.grid_size_z)
-        X, Z = np.meshgrid(x, z)
-        Y = np.zeros_like(X)
-        positions = np.stack([X, Y, Z], axis=-1).reshape(-1, 3)
-
-        cone_mask = np.abs(X) <= Z * t
-        positions = positions[cone_mask.reshape(-1)]
-
-        r_mask = np.sqrt(positions[...,0]**2 + positions[...,2]**2) <= (z_max+distance_to_apex)
-        positions = positions[r_mask.reshape(-1)]
-
-        positions[...,2] -= distance_to_apex
-        positions = positions[positions[...,2] >= 0]
-        
-        return ops.convert_to_tensor(positions, dtype="float32")
-
-    def sample_image_on_positions(self, image, positions, fill_value=0.0, order=1):
-        """Sample a polar/frustum image at arbitrary cone-grid positions."""
-        if len(image.shape) != 4:
-            raise ValueError(f"Image should have shape (B, H, W, C). Got {image.shape}.")
-        if image.shape[-1] != 1:
-            raise ValueError(
-                f"Cone-grid sampling expects a single-channel image, got {image.shape[-1]} channels."
-            )
-
-        image = ops.squeeze(image, axis=-1)
-        image_shape = image.shape
-        rho_range = getattr(self.scan, "rho_range", None)
-        if rho_range is None:
-            rho_range = (self.scan.zlims[0], self.scan.zlims[1] + self.cone_distance_to_apex)
-        theta_range = getattr(self.scan, "theta_range", None)
-        if theta_range is None:
-            theta_range = self.scan.polar_limits
-
-        rho_min, rho_max = rho_range
-        theta_min, theta_max = theta_range
-
-        x = positions[:, 0]
-        z = positions[:, 2] + self.scan.distance_to_apex
-        rho, theta = frustum_convert_xz2rt(x, z, (theta_min, theta_max))
-
-        valid = (
-            (rho >= rho_min)
-            & (rho <= rho_max)
-            & (theta >= theta_min)
-            & (theta <= theta_max)
-        )
-
-        rho_idx = (rho - rho_min) / (rho_max - rho_min) * (image_shape[-2] - 1)
-        theta_idx = (theta - theta_min) / (theta_max - theta_min) * (image_shape[-1] - 1)
-
-        rho_idx = ops.where(valid, rho_idx, -1.0)
-        theta_idx = ops.where(valid, theta_idx, -1.0)
-        coordinates = ops.stack([rho_idx, theta_idx], axis=0)
-
-        def _sample_single(single_image):
-            return map_coordinates(
-                single_image,
-                coordinates,
-                order=order,
-                fill_mode="constant",
-                fill_value=fill_value,
-            )
-
-        return ops.vectorized_map(_sample_single, image)
-
-    def xlims(self,scan):
-        #To correct error in zea
-        radius = max(scan.zlims+scan.distance_to_apex)
-        xlims_polar = (
-            radius * np.cos(-np.pi / 2 + scan.polar_limits[0]),
-            radius * np.cos(-np.pi / 2 + scan.polar_limits[1]),
-        )
-        xlims_plane = (min(scan.probe_geometry[:, 0]), max(scan.probe_geometry[:, 0]))
-        xlims = (
-            min(xlims_polar[0], xlims_plane[0]),
-            max(xlims_polar[1], xlims_plane[1]),
-        )
-        return xlims
+        self.positions = scan.flatgrid if grid is None else grid
+        self.initial_time_offset = n_ax_min / self.scan.sampling_frequency
+        self.n_ax_min = n_ax_min
 
     def select_beams(self, n_equidistant, n_random):
+        #Assert both integers
+        assert isinstance(n_equidistant, int) or n_equidistant == "all", "n_equidistant_beams should be an integer or 'all'"
+        assert isinstance(n_random, int) or n_random == "all", "n_random_beams should be an integer or 'all'"
         if n_equidistant == "all" or n_random == "all":
             return ops.arange(self.scan.n_tx, dtype="int32")
         elif n_equidistant == 0 and n_random == 0:
@@ -410,7 +385,7 @@ class Simulator(Operator):
         elif n_random > 0:
             #choose n random transmits from the scan
             beams = ops.random.shuffle(ops.arange(self.scan.n_tx, dtype="int32"))[:n_random]
-        else:
+        else: #
             raise ValueError("Invalid beam selection strategy. Please check n_equidistant_beams and n_random_beams parameters.")
         
         if self.n_tx_samples > len(beams):
@@ -418,83 +393,30 @@ class Simulator(Operator):
         return beams
     
     def validate_scan(self, scan):
-        required_attrs = ["probe_geometry","apply_lens_correction","sound_speed","lens_sound_speed",
-                          "lens_thickness","n_ax","center_frequency","sampling_frequency","t0_delays",
-                          "initial_times","element_width","attenuation_coef","tx_apodizations"]
-    
-        if not hasattr(scan, "apply_lens_correction"):
-            scan.apply_lens_correction = False  # Default to False if not provided
-            scan.lens_sound_speed = scan.sound_speed  # Default to same as sound speed
-            scan.lens_thickness = 0.0  # Default to no lens thickness
-            log.warning("Scan object missing lens correction attributes. Defaulting to no lens correction.")
-
-        if scan.apply_lens_correction is False:
-            #add these attributes, because they are probably not declared
-            scan.lens_sound_speed = scan.sound_speed
-            scan.lens_thickness = 0.0
-
-        for attr in required_attrs:
-            if not hasattr(scan, attr):
-                raise ValueError(f"Scan object is missing required attribute: {attr}")
-        return scan
-    
+        return _validate_scan(scan)
 
     def image_to_magnitudes(self, image, n_frames):
-        image = translate(image, range_from=(-1,1), range_to=self.scan.dynamic_range)
-        image_lin = 10**(image/20)  # convert from dB to linear scale
-        image_lin = ops.reshape(image_lin, (n_frames, -1))
-        #set magnitudes of pixels z<0 to 0r
-        mask = ops.logical_not(self.positions[:,2] < 0)[None, :]
-        image_lin = image_lin * mask
+        image = translate(image, range_from=(-1,1), range_to=(-320,0))
+        image = ops.reshape(image, (n_frames, -1))
+        image_lin  = ops.exp(image/20) #Means values between 0 and 6.4. 
         return image_lin
 
-    def reparam_amps(self, x, epsilon=0.01):
-        x_scaled = x / epsilon
-        return ops.sign(x) * ops.log1p(ops.abs(x_scaled))
+    def _get_indices(self, seed_el, seed_freq, seed_tx, freq_gaussian_probs):
+        return _sample_indices(
+            self.scan.n_el, self.n_freqs, self.beams,
+            self.n_tx_samples, self.n_freq_samples, self.n_el_samples,
+            seed_el, seed_freq, seed_tx, freq_gaussian_probs,
+        )
 
     def forward(self, image, seed, freq_gaussian_probs=False):
         assert len(image.shape) == 4, "Image should have shape (B, H, W, C)"
         seed_el, seed_freq, seed_tx = split_seed(seed, 3)
         
-        n_frames, *img_shape = image.shape
-        # if self.grid_type == "cone":
-        #     #sample the image at the cone grid positions
-        #     magnitudes = self.sample_image_on_positions(image, self.positions)
-        # else:
-        #     magnitudes = self.image_to_magnitudes(image, n_frames)
+        n_frames = image.shape[0]
+        magnitudes = self.image_to_magnitudes(image, n_frames)
 
-        magnitudes = ops.reshape(image, (n_frames, -1))
-        magnitudes = self.reparam_amps(magnitudes)
-        #sample el, freq and tx
-        el_random = keras.random.uniform(shape=(self.scan.n_el,), seed=seed_el)
-        el_indices = ops.argsort(el_random)[:self.n_el_samples]
+        el_indices, freq_indices, tx_indices = self._get_indices(seed_el, seed_freq, seed_tx, freq_gaussian_probs)
 
-        def _gaussian_probs(_):
-            freq_bins = ops.cast(ops.arange(self.n_freqs), "float32")
-            center_freq_bin = ops.cast(self.n_freqs // 2, "float32")
-            sigma = ops.cast(self.n_freqs / 8, "float32")
-            gaussian_probs = ops.exp(-0.5 * ((freq_bins - center_freq_bin) / sigma) ** 2)
-            return gaussian_probs / ops.sum(gaussian_probs)
-
-        def _uniform_probs(_):
-            return ops.ones((self.n_freqs,), dtype="float32") / self.n_freqs
-
-        p = jax.lax.cond(ops.cast(freq_gaussian_probs, "bool"), _gaussian_probs, _uniform_probs, None)
-
-        log_probs = ops.log(ops.maximum(p, 1e-10))
-        gumbel = -ops.log(-ops.log(keras.random.uniform(shape=(self.n_freqs,), seed=seed_freq)))
-        freq_random = log_probs + gumbel
-        # Gumbel top-k sampling: pick largest scores, not smallest.
-        freq_indices = ops.argsort(freq_random)[-self.n_freq_samples:]
-
-        tx_random = keras.random.uniform(shape=(len(self.beams),), seed=seed_tx)
-        tx_indices = ops.argsort(tx_random)[:self.n_tx_samples]
-
-        el_indices = ops.sort(el_indices)
-        freq_indices = ops.sort(freq_indices)
-        tx_indices = ops.sort(tx_indices)
-
-        tx_indices = ops.take(self.beams, tx_indices)
         # Compute scatterer padding for chunking
         n_scat = self.positions.shape[0]
         chunk_size = self.scatterer_chunk_size
@@ -519,11 +441,11 @@ class Simulator(Operator):
                 sound_speed=self.scan.sound_speed,
                 lens_sound_speed=self.scan.lens_sound_speed,
                 lens_thickness=self.scan.lens_thickness,
-                n_ax=self.scan.n_ax,
+                n_ax=self.scan.n_ax - self.n_ax_min,
                 center_frequency=self.scan.center_frequency,
                 sampling_frequency=self.scan.sampling_frequency,
                 t0_delays=self.scan.t0_delays,
-                initial_times=self.scan.initial_times,
+                initial_times=self.scan.initial_times+self.initial_time_offset,
                 element_width=self.scan.element_width,
                 attenuation_coef=self.scan.attenuation_coef,
                 tx_apodizations=self.scan.tx_apodizations,
@@ -552,9 +474,18 @@ class Simulator(Operator):
     def transpose(self, data, *args, **kwargs):
         raise NotImplementedError("Transpose not implemented for Simulator operator.")
     
+
 class Simulator_Total(Operator):
-    """ Simulator that optimizes other auxiliary variables. 
-    This may not depend on the dynamic range, because that is a visualization parameter, not part of the forward model """
+    """Simulator operator that additionally optimizes scatterer positions and sound speed.
+
+    This is a more flexible version of `Simulator`: in addition to the scatterer
+    amplitudes (derived from the input image, same as `Simulator`), it supports
+    optimizing ``optvars["position_offset"]`` (a per-scatterer position offset, in
+    wavelengths) and ``optvars["sound_speed_offset"]`` (a global sound speed offset).
+
+    When ``optvars["position_offset"]`` is all zeros and ``optvars["sound_speed_offset"]``
+    is ``0.0`` (the defaults), this operator produces the same result as `Simulator`.
+    """
 
     def __init__(self,
              scan,
@@ -565,39 +496,31 @@ class Simulator_Total(Operator):
              position_offset_wl = 0.0,
              sound_speed_offset_scale = 100.0,
              n_equidistant_beams = 0,
-             n_random_beams = 0,):
+             n_random_beams = 0,
+             grid = None,
+             n_ax_min = 0):
         super().__init__()
         self.scan = self.validate_scan(scan)
         self.shape = scan.grid.shape[:2]
-        self.n_tx_samples = n_tx_samples
-        self.n_freqs = 2**int(ops.ceil(ops.log2(self.scan.n_ax))) // 2 + 1
-        self.n_freq_samples = n_freq_samples
-        self.n_el_samples = n_el_samples
+        self.n_tx_samples = scan.n_tx if n_tx_samples is None else n_tx_samples
+        self.n_freqs = 2**int(ops.ceil(ops.log2(self.scan.n_ax-n_ax_min))) // 2 + 1
+        self.n_freq_samples = self.n_freqs if n_freq_samples is None else n_freq_samples
+        self.n_el_samples = scan.n_el if n_el_samples is None else n_el_samples
         self.scatterer_chunk_size = scatterer_chunk_size
         self.sound_speed_offset_scale = sound_speed_offset_scale
-        self.positions = scan.flatgrid + 2 * position_offset_wl * (keras.random.uniform(shape=scan.flatgrid.shape, seed=42)-ops.ones_like(self.scan.flatgrid)*0.5)* scan.wavelength
+        base_positions = scan.flatgrid if grid is None else grid
+        self.positions = base_positions + 2 * position_offset_wl * (keras.random.uniform(shape=base_positions.shape, seed=42)-ops.ones_like(base_positions)*0.5)* scan.wavelength
         self.beams = self.select_beams(n_equidistant_beams, n_random_beams)
+        self.initial_time_offset = n_ax_min / self.scan.sampling_frequency
+        self.n_ax_min = n_ax_min
 
     def validate_scan(self, scan):
-        required_attrs = ["probe_geometry","apply_lens_correction","sound_speed","lens_sound_speed",
-                          "lens_thickness","n_ax","center_frequency","sampling_frequency","t0_delays",
-                          "initial_times","element_width","attenuation_coef","tx_apodizations"]
-    
-        if not hasattr(scan, "apply_lens_correction"):
-            scan.apply_lens_correction = False  # Default to False if not provided
-            scan.lens_sound_speed = scan.sound_speed  # Default to same as sound speed
-            scan.lens_thickness = 0.0  # Default to no lens thickness
-            log.warning("Scan object missing lens correction attributes. Defaulting to no lens correction.")
+        return _validate_scan(scan)
 
-        for attr in required_attrs:
-            if not hasattr(scan, attr):
-                raise ValueError(f"Scan object is missing required attribute: {attr}")
-        return scan
-    
     def select_beams(self, n_equidistant, n_random):
         if n_equidistant == "all" or n_random == "all":
             return ops.arange(self.scan.n_tx, dtype="int32")
-        
+
         if n_equidistant == 0 and n_random == 0:
             raise ValueError("At least one of n_equidistant_beams or n_random_beams must be greater than 0.")
         if n_equidistant > 0 and n_random > 0:
@@ -612,127 +535,69 @@ class Simulator_Total(Operator):
             raise ValueError(f"n_tx_samples ({self.n_tx_samples}) cannot be greater than the number of selected beams ({len(beams)}). Please adjust n_tx_samples or the beam selection strategy.")
         return beams
 
-    def img_to_magnitude(self, image, positions):
-        n_frames = image.shape[0]
+    def image_to_magnitudes(self, image, n_frames):
+        """Convert a (resized) image into scatterer magnitudes. Mirrors `Simulator.image_to_magnitudes`."""
+        image = translate(image, range_from=(-1,1), range_to=(-320,0))
         image = ops.reshape(image, (n_frames, -1))
-        image = self.symlog(image)
-        mask = ops.logical_not(positions[:,2] < 0)[None, :]
-        image = image * mask
-        return image
-    
-    def symlog(self, x, epsilon=0.01):
-        x_scaled = x / epsilon
-        return ops.sign(x) * ops.log1p(ops.abs(x_scaled))
-    
-    def symexp(self, x, epsilon=0.01):
-        a = epsilon * ops.sign(x) * (ops.exp(x) - 1)
-        return a
-    
+        image_lin = ops.exp(image/20)
+        return image_lin
+
     def reparameterize_optvars(self, optvars):
-        """Reparameterize optimization variables.
-        
-        Only unpack and scale variables actually present in optvars to avoid
-        unnecessary tracing through unused array creations during autograd.
+        """Reparameterize the position and sound speed optimization variables.
+
+        With ``optvars["position_offset"]`` all zeros and ``optvars["sound_speed_offset"]``
+        equal to ``0.0`` (the defaults), this reduces to `self.positions` and
+        `self.scan.sound_speed`, matching `Simulator`.
         """
         out = dict(optvars)
-        
-        # Sound speed: only recompute if present
+
         if "sound_speed_offset" in out:
             sound_speed_offset = out["sound_speed_offset"] * self.sound_speed_offset_scale
             sound_speed = ops.maximum(self.scan.sound_speed - sound_speed_offset, 1e-6)
         else:
             sound_speed = self.scan.sound_speed
-        
+
         wavelength = sound_speed / self.scan.center_frequency
-        
-        # Positions: only scale if present
+
         positions = self.positions + (
             out["position_offset"] * wavelength
             if "position_offset" in out
             else ops.zeros_like(self.positions))
 
-        # Element gains: only apply if present
-        element_gains = (
-            out["element_gains"] * 1e-3
-            if "element_gains" in out
-            else ops.zeros((self.scan.n_el,), dtype="float32")
-        )
-        
-        # Initial times: only apply if present
-        initial_times = self.scan.initial_times + (
-            out["initial_times"] * 1e-6
-            if "initial_times" in out
-            else ops.zeros_like(self.scan.initial_times)
-        )
-        
-        # Attenuation: only apply if present
-        attenuation_coef = self.scan.attenuation_coef + (
-            out["attenuation_coef"] * 1e-3
-            if "attenuation_coef" in out
-            else 0.0
-        )
-        
-        factor = out["factor"] if "factor" in out else 1.0
-        return positions, sound_speed, attenuation_coef, element_gains, initial_times, factor
-    
+        return positions, sound_speed
+
     def forward(self, image, optvars, seed, freq_gaussian_probs=False, **kwargs):
         assert isinstance(optvars, dict), "optvars should be a dict"
-        positions, sound_speed, attenuation_coef, element_gains, initial_times, factor = self.reparameterize_optvars(optvars)
-        element_gains = ops.ones((self.scan.n_el,), dtype="float32") + element_gains
+        positions, sound_speed = self.reparameterize_optvars(optvars)
 
         assert len(image.shape) == 4, "Image should have shape (B, H, W, C)"
         image = ops.image.resize(image, self.shape, interpolation="bilinear")
-        magnitudes = self.img_to_magnitude(image, positions)
+        n_frames = image.shape[0]
+        magnitudes = self.image_to_magnitudes(image, n_frames)
 
         seed_el, seed_freq, seed_tx = split_seed(seed, 3)
-
-        #sample el, freq and tx
-        #randomly select n beams from self.beams
-        tx_random = keras.random.uniform(shape=(self.beams.shape[0],), seed=seed_tx)
-        tx_indices = ops.argsort(tx_random)[:self.n_tx_samples]
-        tx_indices = ops.take(self.beams, tx_indices)
-
-        def _gaussian_probs(_):
-            freq_bins = ops.cast(ops.arange(self.n_freqs), "float32")
-            center_freq_bin = ops.cast(self.n_freqs // 2, "float32")
-            sigma = ops.cast(self.n_freqs / 8, "float32")
-            gaussian_probs = ops.exp(-0.5 * ((freq_bins - center_freq_bin) / sigma) ** 2)
-            return gaussian_probs / ops.sum(gaussian_probs)
-
-        def _uniform_probs(_):
-            return ops.ones((self.n_freqs,), dtype="float32") / self.n_freqs
-
-        p = jax.lax.cond(ops.cast(freq_gaussian_probs, "bool"), _gaussian_probs, _uniform_probs, None)
-
-        log_probs = ops.log(ops.maximum(p, 1e-10))
-        gumbel = -ops.log(-ops.log(keras.random.uniform(shape=(self.n_freqs,), seed=seed_freq)))
-        freq_random = log_probs + gumbel
-        # Gumbel top-k sampling: pick largest scores, not smallest.
-        freq_indices = ops.argsort(freq_random)[-self.n_freq_samples:]
-
-        el_random = keras.random.uniform(shape=(self.scan.n_el,), seed=seed_el)
-        el_indices = ops.argsort(el_random)[:self.n_el_samples]
-
-        tx_indices = ops.sort(tx_indices)
-        freq_indices = ops.sort(freq_indices)
-        el_indices = ops.sort(el_indices)
+        el_indices, freq_indices, tx_indices = _sample_indices(
+            self.scan.n_el, self.n_freqs, self.beams,
+            self.n_tx_samples, self.n_freq_samples, self.n_el_samples,
+            seed_el, seed_freq, seed_tx, freq_gaussian_probs,
+        )
 
         # Compute scatterer padding for chunking
-        n_scat = self.positions.shape[0]
+        n_scat = positions.shape[0]
         chunk_size = self.scatterer_chunk_size
         n_scat_padded = n_scat + (chunk_size - (n_scat % chunk_size)) % chunk_size
-        n_chunks = n_scat_padded // chunk_size  
+        n_chunks = n_scat_padded // chunk_size
 
         #pad and reshape positions and magnitudes for chunking
-        positions = ops.pad(positions, ((0, n_scat_padded - n_scat), (0, 0)))
-        position_chunks = ops.reshape(positions, (n_chunks, chunk_size, 3))
+        positions_padded = ops.pad(positions, ((0, n_scat_padded - n_scat), (0, 0)))
+        position_chunks = ops.reshape(positions_padded, (n_chunks, chunk_size, 3))
         magnitudes_padded = ops.pad(magnitudes, ((0, 0), (0, n_scat_padded - n_scat)))
 
-        def simulate_chunk(scat_chunk, amp_chunk):
+        def simulate_chunk(pos_chunk, mag_chunk):
             """Simulate RF for a single scatterer chunk."""
             return simulate_rf(
-                scatterer_positions=scat_chunk,
-                scatterer_magnitudes=amp_chunk,
+                scatterer_positions=pos_chunk,
+                scatterer_magnitudes=mag_chunk,
                 el_indices=el_indices,
                 freq_indices=freq_indices,
                 tx_indices=tx_indices,
@@ -741,20 +606,20 @@ class Simulator_Total(Operator):
                 sound_speed=sound_speed,
                 lens_sound_speed=self.scan.lens_sound_speed,
                 lens_thickness=self.scan.lens_thickness,
-                n_ax=self.scan.n_ax,
+                n_ax=self.scan.n_ax - self.n_ax_min,
                 center_frequency=self.scan.center_frequency,
                 sampling_frequency=self.scan.sampling_frequency,
                 t0_delays=self.scan.t0_delays,
-                initial_times=initial_times,
+                initial_times=self.scan.initial_times + self.initial_time_offset,
                 element_width=self.scan.element_width,
-                attenuation_coef=attenuation_coef,
+                attenuation_coef=self.scan.attenuation_coef,
                 tx_apodizations=self.scan.tx_apodizations,
             )
-        
+
         @jax.checkpoint
         def accumulate_chunks(rf_accumulated, chunk):
-            scat_chunk, amp_chunk = chunk
-            rf_accumulated = rf_accumulated + simulate_chunk(scat_chunk, amp_chunk)
+            pos_chunk, mag_chunk = chunk
+            rf_accumulated = rf_accumulated + simulate_chunk(pos_chunk, mag_chunk)
             return rf_accumulated, None
 
         @jax.checkpoint
@@ -763,16 +628,15 @@ class Simulator_Total(Operator):
             rf_init = ops.zeros((self.n_tx_samples, self.n_freq_samples, self.n_el_samples, 1), dtype='complex64')
             rf_accumulated, _ = ops.scan(accumulate_chunks, rf_init, (position_chunks, magnitude_chunks))
             return carry, rf_accumulated
-        
+
         _, rf_data = ops.scan(process_frame, None, magnitudes_padded)
-        element_gains = ops.take(element_gains, el_indices)
-        return element_gains[None, None, :, None]*rf_data*factor, tx_indices, freq_indices, el_indices
-        
+        return rf_data, tx_indices, freq_indices, el_indices
+
     def __str__(self):
-        return f"Simulator_Total with {self.n_tx_samples} tx samples, {self.n_freq_samples} freq samples, and {self.n_el_samples} el samples. Optimizing auxiliary variables"
-    
+        return f"Simulator_Total with {self.n_tx_samples} tx samples, {self.n_freq_samples} freq samples, and {self.n_el_samples} el samples. Optimizing position_offset and sound_speed_offset."
+
     def transpose(self, data, *args, **kwargs):
-        raise NotImplementedError("Transpose not implemented for Simulator_Total operator.")   
+        raise NotImplementedError("Transpose not implemented for Simulator_Total operator.")
 
 class Simulator_GD(Operator):
     """ Simulator that optimizes other auxiliary variables. 
@@ -1102,149 +966,6 @@ class Simulator_GD(Operator):
         _, rf_data = ops.scan(process_frame, None, magnitudes_padded)
         element_gains = ops.take(element_gains, el_indices)
         return element_gains[None, None, None, :, None]*rf_data*factor, tx_indices, freq_indices, el_indices
-        
-    def __str__(self):
-        return f"Simulator_GD with {self.n_tx_samples} tx samples, {self.n_freq_samples} freq samples, and {self.n_el_samples} el samples. Optimizing auxiliary variables"
-    
-    def transpose(self, data, *args, **kwargs):
-        raise NotImplementedError("Transpose not implemented for Simulator_GD operator.")   
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-class Simulator_Final_V5(Operator):
-    """ Simulator that optimizes other auxiliary variables. 
-    This may not depend on the dynamic range, because that is a visualization parameter, not part of the forward model """
-
-    def __init__(self,
-             scan,
-             data_dict,
-             n_tx_samples,
-             n_freq_samples,
-             n_el_samples,
-             scatterer_chunk_size = 2048,):
-        super().__init__()
-        self.scan = self.validate_scan(scan)
-        self.data_dict = data_dict
-        self.n_tx_samples = n_tx_samples
-        self.n_freqs = 2**int(ops.ceil(ops.log2(self.scan.n_ax))) // 2 + 1
-        self.n_freq_samples = n_freq_samples
-        self.n_el_samples = n_el_samples
-        self.scatterer_chunk_size = scatterer_chunk_size
-        self.beams = jnp.asarray(self.scan.selected_transmits)
-
-    def validate_scan(self, scan):
-        required_attrs = ["probe_geometry","apply_lens_correction","sound_speed","lens_sound_speed",
-                          "lens_thickness","n_ax","center_frequency","sampling_frequency","t0_delays",
-                          "initial_times","element_width","attenuation_coef","tx_apodizations"]
-    
-        if not hasattr(scan, "apply_lens_correction"):
-            scan.apply_lens_correction = False  # Default to False if not provided
-            log.warning("Scan object missing lens correction attributes. Defaulting to no lens correction.")
-        if not hasattr(scan, "lens_sound_speed"):
-            scan.lens_sound_speed = scan.sound_speed  # Default to same as sound speed
-            log.warning("Scan object missing lens_sound_speed attribute. Defaulting to same as sound_speed.")
-        if not hasattr(scan, "lens_thickness"):
-            scan.lens_thickness = 0.0  # Default to no lens thickness
-            log.warning("Scan object missing lens_thickness attribute. Defaulting to 0.0 (no lens).")
-            
-        for attr in required_attrs:
-            if not hasattr(scan, attr):
-                raise ValueError(f"Scan object is missing required attribute: {attr}")
-        return scan
-        
-    def forward(self, positions, magnitudes, sound_speed, seed):
-        seed_el, seed_freq, seed_tx = split_seed(seed, 3)
-
-        #sample el, freq and tx
-        #randomly select n beams from self.beams
-        tx_random = keras.random.uniform(shape=(self.beams.shape[0],), seed=seed_tx)
-        tx_indices = ops.argsort(tx_random)[:self.n_tx_samples]
-
-        def _gaussian_probs(_):
-            freq_bins = ops.cast(ops.arange(self.n_freqs), "float32")
-            center_freq_bin = ops.cast(self.n_freqs // 2, "float32")
-            sigma = ops.cast(self.n_freqs / 8, "float32")
-            gaussian_probs = ops.exp(-0.5 * ((freq_bins - center_freq_bin) / sigma) ** 2)
-            return gaussian_probs / ops.sum(gaussian_probs)
-
-        def _uniform_probs(_):
-            return ops.ones((self.n_freqs,), dtype="float32") / self.n_freqs
-
-        p = jax.lax.cond(ops.cast(self.data_dict["freq_gaussian_probs"], "bool"), _gaussian_probs, _uniform_probs, None)
-
-        log_probs = ops.log(ops.maximum(p, 1e-10))
-        gumbel = -ops.log(-ops.log(keras.random.uniform(shape=(self.n_freqs,), seed=seed_freq)))
-        freq_random = log_probs + gumbel
-        # Gumbel top-k sampling: pick largest scores, not smallest.
-        freq_indices = ops.argsort(freq_random)[-self.n_freq_samples:]
-
-        el_random = keras.random.uniform(shape=(self.scan.n_el,), seed=seed_el)
-        el_indices = ops.argsort(el_random)[:self.n_el_samples]
-
-        tx_indices = ops.sort(tx_indices)
-        freq_indices = ops.sort(freq_indices)
-        el_indices = ops.sort(el_indices)
-
-        # Compute scatterer padding for chunking
-        n_scat = positions.shape[0]
-        chunk_size = self.scatterer_chunk_size
-        n_scat_padded = n_scat + (chunk_size - (n_scat % chunk_size)) % chunk_size
-        n_chunks = n_scat_padded // chunk_size  
-
-        #pad and reshape positions and magnitudes for chunking
-        positions = ops.pad(positions, ((0, n_scat_padded - n_scat), (0, 0)))
-        position_chunks = ops.reshape(positions, (n_chunks, chunk_size, 3))
-        magnitudes_padded = ops.pad(magnitudes, ((0, 0), (0, n_scat_padded - n_scat)))
-
-        def simulate_chunk(pos_chunk, amp_chunk):
-            """Simulate RF for a single scatterer chunk."""
-            return simulate_rf(
-                scatterer_positions=pos_chunk,
-                scatterer_magnitudes=amp_chunk,
-                sound_speed=sound_speed,
-                el_indices=el_indices,
-                freq_indices=freq_indices,
-                tx_indices=tx_indices,
-                probe_geometry=self.data_dict["probe_geometry"],
-                apply_lens_correction=self.scan.apply_lens_correction,
-                lens_sound_speed=self.scan.lens_sound_speed,
-                lens_thickness=self.scan.lens_thickness,
-                n_ax=self.data_dict["n_ax"],
-                center_frequency=self.data_dict["center_frequency"],
-                sampling_frequency=self.data_dict["sampling_frequency"],
-                t0_delays=self.data_dict["t0_delays"],
-                initial_times=self.data_dict["initial_times"]+1/self.data_dict["sampling_frequency"]*self.data_dict["ax_min"],
-                element_width=self.data_dict["element_width"],
-                attenuation_coef=self.data_dict["attenuation_coef"],
-                tx_apodizations=self.data_dict["tx_apodizations"],
-            )
-        
-        @jax.checkpoint
-        def accumulate_chunks(rf_accumulated, chunk):
-            pos_chunk, amp_chunk = chunk
-            rf_accumulated = rf_accumulated + simulate_chunk(pos_chunk, amp_chunk)
-            return rf_accumulated, None
-
-        @jax.checkpoint
-        def process_frame(carry, frame_data):
-            magnitude_chunks = ops.reshape(frame_data, (n_chunks, chunk_size))
-            rf_init = ops.zeros((self.n_tx_samples, self.n_freq_samples, self.n_el_samples, 1), dtype='complex64')
-            rf_accumulated, _ = ops.scan(accumulate_chunks, rf_init, (position_chunks, magnitude_chunks))
-            return carry, rf_accumulated
-        
-        _, rf_data = ops.scan(process_frame, None, magnitudes_padded)
-        return rf_data, tx_indices, freq_indices, el_indices
         
     def __str__(self):
         return f"Simulator_GD with {self.n_tx_samples} tx samples, {self.n_freq_samples} freq samples, and {self.n_el_samples} el samples. Optimizing auxiliary variables"
