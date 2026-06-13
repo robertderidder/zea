@@ -30,7 +30,7 @@ repos:
     description: Check yaml files for parseable syntax
   - id: check-added-large-files
     description: Prevent large files from being committed
-    exclude: ^docs/source/notebooks/
+    exclude: ^(docs/source/notebooks/|uv\.lock$)
   - id: check-merge-conflict
     description: Check for files that contain merge conflict strings
   - id: detect-private-key
