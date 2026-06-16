@@ -244,7 +244,6 @@ def simulate_partial_rf_data(
     waveform_function: bool = None,
     ax_chunk_size: int = 1024,
     scatterer_chunk_size: int = 1024,
-    verbose: bool = False
 ):
     """Simulates a subset of rf_data points. The axial, element and transmit indices have to be chosen in advance.
     Tis implementation is purely written in JAX so it can be jitted without running into OOM issues. 

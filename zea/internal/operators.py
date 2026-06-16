@@ -21,6 +21,8 @@ import jax
 import jax.numpy as jnp
 from zea.display import frustum_convert_xz2rt, map_coordinates
 
+from zea.simulator_time import simulate_partial_rf_data
+
 class Operator(abc.ABC, Object):
     """Operator base class.
 
@@ -306,8 +308,6 @@ def _sample_indices(n_el, n_freqs, beams, n_tx_samples, n_freq_samples, n_el_sam
     Shared between `Simulator` and `Simulator_Total` so both operators sample
     identical indices given the same seeds.
     """
-    el_random = keras.random.uniform(shape=(n_el,), seed=seed_el)
-    el_indices = ops.argsort(el_random)[:n_el_samples]
 
     def _gaussian_probs(_):
         freq_bins = ops.cast(ops.arange(n_freqs), "float32")
@@ -328,6 +328,9 @@ def _sample_indices(n_el, n_freqs, beams, n_tx_samples, n_freq_samples, n_el_sam
 
     tx_random = keras.random.uniform(shape=(len(beams),), seed=seed_tx)
     tx_indices = ops.argsort(tx_random)[:n_tx_samples]
+
+    el_random = keras.random.uniform(shape=(n_el,), seed=seed_el)
+    el_indices = ops.argsort(el_random)[:n_el_samples]
 
     el_indices = ops.sort(el_indices)
     freq_indices = ops.sort(freq_indices)
@@ -365,9 +368,17 @@ class Simulator(Operator):
         self.n_el_samples = scan.n_el if n_el_samples is None else n_el_samples
         self.scatterer_chunk_size = scatterer_chunk_size
         self.beams = self.select_beams(n_equidistant_beams, n_random_beams)
-        self.positions = scan.flatgrid if grid is None else grid
+        self.positions = scan.flatgrid if grid is None else grid if grid.ndim==2 else ValueError(f"grid should be 2D, but got shape {grid.shape}")
+        self.cell_size = ops.convert_to_tensor(scan.flatgrid_cell_size, dtype="float32")
+        self.cell_area = ops.convert_to_tensor(scan.flatgrid_cell_area, dtype="float32")
+        # Normalize so the mean weight is 1: preserves the *relative* per-scatterer
+        # area weighting (e.g. far-field cells vs. near-apex cells on a polar grid)
+        # while keeping the overall output scale compatible with omega/eps, which
+        # were tuned without any area weighting.
+        self.cell_area = self.cell_area / ops.mean(self.cell_area)
         self.initial_time_offset = n_ax_min / self.scan.sampling_frequency
         self.n_ax_min = n_ax_min
+        self.tcg = self.scan.tgc_gain_curve
 
     def select_beams(self, n_equidistant, n_random):
         #Assert both integers
@@ -396,10 +407,14 @@ class Simulator(Operator):
         return _validate_scan(scan)
 
     def image_to_magnitudes(self, image, n_frames):
+        assert image.max() < 1.01 and image.min() > -1.01, "Image values should be in the range [-1, 1]. got (min, max) = ({image.min()}, {image.max()})"  
         image = translate(image, range_from=(-1,1), range_to=(-320,0))
         image = ops.reshape(image, (n_frames, -1))
-        image_lin  = ops.exp(image/20) #Means values between 0 and 6.4. 
-        return image_lin
+        image_lin  = ops.exp(image/20) #Means values between 0 and 6.4.
+        # Riemann-sum area weighting: each scatterer represents a grid cell of area
+        # self.cell_area, not a point, so its contribution must scale with that area
+        # for the discretization to converge as grid_size changes.
+        return image_lin * self.cell_area[None, :]
 
     def _get_indices(self, seed_el, seed_freq, seed_tx, freq_gaussian_probs):
         return _sample_indices(
@@ -426,13 +441,16 @@ class Simulator(Operator):
         # Pad and pre-reshape positions into (n_chunks, chunk_size, 3)
         positions_padded = ops.pad(self.positions, ((0, n_scat_padded - n_scat), (0, 0)))
         position_chunks = ops.reshape(positions_padded, (n_chunks, chunk_size, 3))
+        cell_size_padded = ops.pad(self.cell_size, ((0, n_scat_padded - n_scat), (0, 0)))
+        cell_size_chunks = ops.reshape(cell_size_padded, (n_chunks, chunk_size, 2))
         magnitudes_padded = ops.pad(magnitudes, ((0, 0), (0, n_scat_padded - n_scat)))
-        
-        def simulate_chunk(pos_chunk, mag_chunk):
+
+        def simulate_chunk(pos_chunk, mag_chunk, cell_chunk):
             """Simulate RF for a single scatterer chunk."""
             return simulate_rf(
                 scatterer_positions=pos_chunk,
                 scatterer_magnitudes=mag_chunk,
+                scatterer_cell_size=cell_chunk,
                 el_indices=el_indices,
                 freq_indices=freq_indices,
                 tx_indices=tx_indices,
@@ -450,20 +468,20 @@ class Simulator(Operator):
                 attenuation_coef=self.scan.attenuation_coef,
                 tx_apodizations=self.scan.tx_apodizations,
             )
-        
+
         @jax.checkpoint
         def accumulate_chunks(rf_accumulated, chunk):
-            pos_chunk, mag_chunk = chunk
-            rf_accumulated = rf_accumulated + simulate_chunk(pos_chunk, mag_chunk)
+            pos_chunk, mag_chunk, cell_chunk = chunk
+            rf_accumulated = rf_accumulated + simulate_chunk(pos_chunk, mag_chunk, cell_chunk)
             return rf_accumulated, None
 
         @jax.checkpoint
         def process_frame(carry, frame_data):
             magnitude_chunks = ops.reshape(frame_data, (n_chunks, chunk_size))
             rf_init = ops.zeros((self.n_tx_samples, self.n_freq_samples, self.n_el_samples, 1), dtype='complex64')
-            rf_accumulated, _ = ops.scan(accumulate_chunks, rf_init, (position_chunks, magnitude_chunks))
+            rf_accumulated, _ = ops.scan(accumulate_chunks, rf_init, (position_chunks, magnitude_chunks, cell_size_chunks))
             return carry, rf_accumulated
-        
+
         _, rf_data = ops.scan(process_frame, None, magnitudes_padded)
 
         return rf_data, tx_indices, freq_indices, el_indices
@@ -510,6 +528,13 @@ class Simulator_Total(Operator):
         self.sound_speed_offset_scale = sound_speed_offset_scale
         base_positions = scan.flatgrid if grid is None else grid
         self.positions = base_positions + 2 * position_offset_wl * (keras.random.uniform(shape=base_positions.shape, seed=42)-ops.ones_like(base_positions)*0.5)* scan.wavelength
+        self.cell_size = ops.convert_to_tensor(scan.flatgrid_cell_size, dtype="float32")
+        self.cell_area = ops.convert_to_tensor(scan.flatgrid_cell_area, dtype="float32")
+        # Normalize so the mean weight is 1: preserves the *relative* per-scatterer
+        # area weighting (e.g. far-field cells vs. near-apex cells on a polar grid)
+        # while keeping the overall output scale compatible with omega/eps, which
+        # were tuned without any area weighting.
+        self.cell_area = self.cell_area / ops.mean(self.cell_area)
         self.beams = self.select_beams(n_equidistant_beams, n_random_beams)
         self.initial_time_offset = n_ax_min / self.scan.sampling_frequency
         self.n_ax_min = n_ax_min
@@ -540,7 +565,8 @@ class Simulator_Total(Operator):
         image = translate(image, range_from=(-1,1), range_to=(-320,0))
         image = ops.reshape(image, (n_frames, -1))
         image_lin = ops.exp(image/20)
-        return image_lin
+        # Riemann-sum area weighting, see `Simulator.image_to_magnitudes`.
+        return image_lin * self.cell_area[None, :]
 
     def reparameterize_optvars(self, optvars):
         """Reparameterize the position and sound speed optimization variables.
@@ -588,16 +614,19 @@ class Simulator_Total(Operator):
         n_scat_padded = n_scat + (chunk_size - (n_scat % chunk_size)) % chunk_size
         n_chunks = n_scat_padded // chunk_size
 
-        #pad and reshape positions and magnitudes for chunking
+        #pad and reshape positions, cell sizes and magnitudes for chunking
         positions_padded = ops.pad(positions, ((0, n_scat_padded - n_scat), (0, 0)))
         position_chunks = ops.reshape(positions_padded, (n_chunks, chunk_size, 3))
+        cell_size_padded = ops.pad(self.cell_size, ((0, n_scat_padded - n_scat), (0, 0)))
+        cell_size_chunks = ops.reshape(cell_size_padded, (n_chunks, chunk_size, 2))
         magnitudes_padded = ops.pad(magnitudes, ((0, 0), (0, n_scat_padded - n_scat)))
 
-        def simulate_chunk(pos_chunk, mag_chunk):
+        def simulate_chunk(pos_chunk, mag_chunk, cell_chunk):
             """Simulate RF for a single scatterer chunk."""
             return simulate_rf(
                 scatterer_positions=pos_chunk,
                 scatterer_magnitudes=mag_chunk,
+                scatterer_cell_size=cell_chunk,
                 el_indices=el_indices,
                 freq_indices=freq_indices,
                 tx_indices=tx_indices,
@@ -618,15 +647,15 @@ class Simulator_Total(Operator):
 
         @jax.checkpoint
         def accumulate_chunks(rf_accumulated, chunk):
-            pos_chunk, mag_chunk = chunk
-            rf_accumulated = rf_accumulated + simulate_chunk(pos_chunk, mag_chunk)
+            pos_chunk, mag_chunk, cell_chunk = chunk
+            rf_accumulated = rf_accumulated + simulate_chunk(pos_chunk, mag_chunk, cell_chunk)
             return rf_accumulated, None
 
         @jax.checkpoint
         def process_frame(carry, frame_data):
             magnitude_chunks = ops.reshape(frame_data, (n_chunks, chunk_size))
             rf_init = ops.zeros((self.n_tx_samples, self.n_freq_samples, self.n_el_samples, 1), dtype='complex64')
-            rf_accumulated, _ = ops.scan(accumulate_chunks, rf_init, (position_chunks, magnitude_chunks))
+            rf_accumulated, _ = ops.scan(accumulate_chunks, rf_init, (position_chunks, magnitude_chunks, cell_size_chunks))
             return carry, rf_accumulated
 
         _, rf_data = ops.scan(process_frame, None, magnitudes_padded)
@@ -637,6 +666,188 @@ class Simulator_Total(Operator):
 
     def transpose(self, data, *args, **kwargs):
         raise NotImplementedError("Transpose not implemented for Simulator_Total operator.")
+
+class Simlator_Time(Operator):
+    """Simulator operator that additionally optimizes scatterer positions and sound speed.
+
+    This is a more flexible version of `Simulator`: in addition to the scatterer
+    amplitudes (derived from the input image, same as `Simulator`), it supports
+    optimizing ``optvars["position_offset"]`` (a per-scatterer position offset, in
+    wavelengths) and ``optvars["sound_speed_offset"]`` (a global sound speed offset).
+
+    When ``optvars["position_offset"]`` is all zeros and ``optvars["sound_speed_offset"]``
+    is ``0.0`` (the defaults), this operator produces the same result as `Simulator`.
+    """
+
+    def __init__(self,
+             scan,
+             n_tx_samples,
+             n_ax_samples,
+             n_el_samples,
+             scatterer_chunk_size = 256,
+             position_offset_wl = 0.0,
+             sound_speed_offset_scale = 100.0,
+             n_equidistant_beams = 0,
+             n_random_beams = 0,
+             grid = None,
+             n_ax_min = 0):
+        super().__init__()
+        self.scan = self.validate_scan(scan)
+        self.shape = scan.grid.shape[:2]
+        self.n_tx_samples = scan.n_tx if n_tx_samples is None else n_tx_samples
+        self.n_ax_samples = scan.n_ax if n_ax_samples is None else n_ax_samples
+        self.n_el_samples = scan.n_el if n_el_samples is None else n_el_samples
+        self.scatterer_chunk_size = scatterer_chunk_size
+        self.sound_speed_offset_scale = sound_speed_offset_scale
+        base_positions = scan.flatgrid if grid is None else grid
+        self.positions = base_positions + 2 * position_offset_wl * (keras.random.uniform(shape=base_positions.shape, seed=42)-ops.ones_like(base_positions)*0.5)* scan.wavelength
+        self.cell_size = ops.convert_to_tensor(scan.flatgrid_cell_size, dtype="float32")
+        self.cell_area = ops.convert_to_tensor(scan.flatgrid_cell_area, dtype="float32")
+        # Normalize so the mean weight is 1: preserves the *relative* per-scatterer
+        # area weighting (e.g. far-field cells vs. near-apex cells on a polar grid)
+        # while keeping the overall output scale compatible with omega/eps, which
+        # were tuned without any area weighting.
+        self.cell_area = self.cell_area / ops.mean(self.cell_area)
+        self.beams = self.select_beams(n_equidistant_beams, n_random_beams)
+        self.initial_time_offset = n_ax_min / self.scan.sampling_frequency
+        self.n_ax_min = n_ax_min
+
+    def validate_scan(self, scan):
+        return _validate_scan(scan)
+
+    def select_beams(self, n_equidistant, n_random):
+        if n_equidistant == "all" or n_random == "all":
+            return ops.arange(self.scan.n_tx, dtype="int32")
+
+        if n_equidistant == 0 and n_random == 0:
+            raise ValueError("At least one of n_equidistant_beams or n_random_beams must be greater than 0.")
+        if n_equidistant > 0 and n_random > 0:
+            raise ValueError("n_equidistant_beams and n_random_beams cannot both be greater than 0. Please choose one sampling strategy.")
+        if n_equidistant > 0:
+            #choose n equidistant transmits from the scan
+            beams = ops.linspace(0, self.scan.n_tx-1, n_equidistant, dtype="int32")
+        if n_random > 0:
+            #choose n random transmits from the scan
+            beams = ops.random.shuffle(ops.arange(self.scan.n_tx, dtype="int32"))[:n_random]
+        if self.n_tx_samples > len(beams):
+            raise ValueError(f"n_tx_samples ({self.n_tx_samples}) cannot be greater than the number of selected beams ({len(beams)}). Please adjust n_tx_samples or the beam selection strategy.")
+        return beams
+
+    def image_to_magnitudes(self, image, n_frames):
+        """Convert a (resized) image into scatterer magnitudes. Mirrors `Simulator.image_to_magnitudes`."""
+        image = translate(image, range_from=(-1,1), range_to=(-320,0))
+        image = ops.reshape(image, (n_frames, -1))
+        image_lin = ops.exp(image/20)
+        # Riemann-sum area weighting, see `Simulator.image_to_magnitudes`.
+        return image_lin * self.cell_area[None, :]
+
+    def reparameterize_optvars(self, optvars):
+        """Reparameterize the position and sound speed optimization variables.
+
+        With ``optvars["position_offset"]`` all zeros and ``optvars["sound_speed_offset"]``
+        equal to ``0.0`` (the defaults), this reduces to `self.positions` and
+        `self.scan.sound_speed`, matching `Simulator`.
+        """
+        out = dict(optvars)
+
+        if "sound_speed_offset" in out:
+            sound_speed_offset = out["sound_speed_offset"] * self.sound_speed_offset_scale
+            sound_speed = ops.maximum(self.scan.sound_speed - sound_speed_offset, 1e-6)
+        else:
+            sound_speed = self.scan.sound_speed
+
+        wavelength = sound_speed / self.scan.center_frequency
+
+        positions = self.positions + (
+            out["position_offset"] * wavelength
+            if "position_offset" in out
+            else ops.zeros_like(self.positions))
+
+        return positions, sound_speed
+
+    def forward(self, image, optvars, seed, freq_gaussian_probs=False, **kwargs):
+        assert isinstance(optvars, dict), "optvars should be a dict"
+        positions, sound_speed = self.reparameterize_optvars(optvars)
+
+        assert len(image.shape) == 4, "Image should have shape (B, H, W, C)"
+        image = ops.image.resize(image, self.shape, interpolation="bilinear")
+        n_frames = image.shape[0]
+        magnitudes = self.image_to_magnitudes(image, n_frames)
+
+        seed_el, seed_freq, seed_tx = split_seed(seed, 3)
+        
+        tx_random = keras.random.uniform(shape=(len(self.beams),), seed=seed_tx)
+        tx_indices = ops.argsort(tx_random)[:self.n_tx_samples]
+
+        ax_random = keras.random.uniform(shape=(self.scan.n_ax,), seed=seed_freq)
+        ax_indices = ops.argsort(ax_random)[:self.n_ax_samples]
+
+        el_random = keras.random.uniform(shape=(self.scan.n_el,), seed=seed_el)
+        el_indices = ops.argsort(el_random)[:self.n_el_samples]
+
+        tx_indices = ops.sort(tx_indices)
+        ax_indices = ops.sort(ax_indices)
+        el_indices = ops.sort(el_indices)
+
+        # Compute scatterer padding for chunking
+        n_scat = positions.shape[0]
+        chunk_size = self.scatterer_chunk_size
+        n_scat_padded = n_scat + (chunk_size - (n_scat % chunk_size)) % chunk_size
+        n_chunks = n_scat_padded // chunk_size
+
+        #pad and reshape positions, cell sizes and magnitudes for chunking
+        positions_padded = ops.pad(positions, ((0, n_scat_padded - n_scat), (0, 0)))
+        position_chunks = ops.reshape(positions_padded, (n_chunks, chunk_size, 3))
+        cell_size_padded = ops.pad(self.cell_size, ((0, n_scat_padded - n_scat), (0, 0)))
+        cell_size_chunks = ops.reshape(cell_size_padded, (n_chunks, chunk_size, 2))
+        magnitudes_padded = ops.pad(magnitudes, ((0, 0), (0, n_scat_padded - n_scat)))
+
+        def simulate_chunk(pos_chunk, mag_chunk, cell_chunk):
+            """Simulate RF for a single scatterer chunk."""
+            return simulate_partial_rf_data(
+                scatterer_positions=pos_chunk,
+                scatterer_magnitudes=mag_chunk,
+                scatterer_cell_size=cell_chunk,
+                el_indices=el_indices,
+                ax_indices=ax_indices,
+                tx_indices=tx_indices,
+                probe_geometry=self.scan.probe_geometry,
+                apply_lens_correction=self.scan.apply_lens_correction,
+                sound_speed=sound_speed,
+                lens_sound_speed=self.scan.lens_sound_speed,
+                lens_thickness=self.scan.lens_thickness,
+                n_ax=self.scan.n_ax - self.n_ax_min,
+                center_frequency=self.scan.center_frequency,
+                sampling_frequency=self.scan.sampling_frequency,
+                t0_delays=self.scan.t0_delays,
+                initial_times=self.scan.initial_times + self.initial_time_offset,
+                element_width=self.scan.element_width,
+                attenuation_coef=self.scan.attenuation_coef,
+                tx_apodizations=self.scan.tx_apodizations,
+            )
+
+        @jax.checkpoint
+        def accumulate_chunks(rf_accumulated, chunk):
+            pos_chunk, mag_chunk, cell_chunk = chunk
+            rf_accumulated = rf_accumulated + simulate_chunk(pos_chunk, mag_chunk, cell_chunk)
+            return rf_accumulated, None
+
+        @jax.checkpoint
+        def process_frame(carry, frame_data):
+            magnitude_chunks = ops.reshape(frame_data, (n_chunks, chunk_size))
+            rf_init = ops.zeros((self.n_tx_samples, self.n_freq_samples, self.n_el_samples, 1), dtype='complex64')
+            rf_accumulated, _ = ops.scan(accumulate_chunks, rf_init, (position_chunks, magnitude_chunks, cell_size_chunks))
+            return carry, rf_accumulated
+
+        _, rf_data = ops.scan(process_frame, None, magnitudes_padded)
+        return rf_data, tx_indices, ax_indices, el_indices
+
+    def __str__(self):
+        return f"Simulator_Total with {self.n_tx_samples} tx samples, {self.n_freq_samples} freq samples, and {self.n_el_samples} el samples. Optimizing position_offset and sound_speed_offset."
+
+    def transpose(self, data, *args, **kwargs):
+        raise NotImplementedError("Transpose not implemented for Simulator_Time operator.")
+
 
 class Simulator_GD(Operator):
     """ Simulator that optimizes other auxiliary variables. 
