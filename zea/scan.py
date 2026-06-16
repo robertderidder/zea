@@ -425,6 +425,64 @@ class Scan(Parameters):
         """The beamforming grid of shape (grid_size_z*grid_size_x*grid_size_y, 3)."""
         return self.grid.reshape(-1, 3)
 
+    @cache_with_dependencies(
+        "grid",
+        "grid_type",
+        "is_3d",
+        "zlims",
+        "xlims",
+        "grid_size_x",
+        "grid_size_z",
+        "polar_limits",
+        "distance_to_apex",
+    )
+    def grid_cell_size(self):
+        """The (dz, dx) size [m] of each beamforming grid cell, of shape
+        (grid_size_z, grid_size_x, 2).
+
+        For a cartesian grid the cell size is uniform. For a polar grid the axial
+        extent ``dz`` (radial spacing) is constant, while the lateral extent ``dx``
+        (arc length) grows with depth, since polar grid cells fan out from the apex.
+        """
+        if self.grid_type == "polar":
+            if self.is_3d:
+                raise NotImplementedError("3D polar grids are not yet supported.")
+            rho_min, rho_max = self.zlims[0], self.zlims[1] + self.distance_to_apex
+            dz = (rho_max - rho_min) / self.grid_size_z
+            dtheta = (self.polar_limits[1] - self.polar_limits[0]) / max(self.grid_size_x - 1, 1)
+            radius = np.sqrt(
+                self.grid[..., 0] ** 2 + (self.grid[..., 2] + self.distance_to_apex) ** 2
+            )
+            dx = radius * abs(dtheta)
+            return np.stack([np.full_like(dx, dz), dx], axis=-1)
+        elif self.grid_type == "cartesian":
+            dz = (self.zlims[1] - self.zlims[0]) / max(self.grid_size_z - 1, 1)
+            dx = (self.xlims[1] - self.xlims[0]) / max(self.grid_size_x - 1, 1)
+            return np.broadcast_to(np.array([dz, dx]), self.grid.shape[:-1] + (2,)).copy()
+        else:
+            raise ValueError(
+                f"Unsupported grid type: {self.grid_type}. Supported types are "
+                "'cartesian' and 'polar'."
+            )
+
+    @cache_with_dependencies("grid_cell_size")
+    def flatgrid_cell_size(self):
+        """The (dz, dx) size [m] of each scatterer's cell, of shape
+        (grid_size_z*grid_size_x*grid_size_y, 2). See :attr:`grid_cell_size`."""
+        return self.grid_cell_size.reshape(-1, 2)
+
+    @cache_with_dependencies("flatgrid_cell_size")
+    def flatgrid_cell_area(self):
+        """The area [m^2] of each scatterer's cell, of shape
+        (grid_size_z*grid_size_x*grid_size_y,).
+
+        Used to weight scatterer magnitudes in a Riemann-sum sense, so that each
+        scatterer represents a finite-area patch of the image rather than a Dirac
+        point. This is what gives scatterers a finite area instead of being an
+        idealized point (Dirac delta).
+        """
+        return self.flatgrid_cell_size[:, 0] * self.flatgrid_cell_size[:, 1]
+
     @cache_with_dependencies("grid_size_x", "grid_size_y", "grid_size_z")
     def is_3d(self):
         return self.grid_size_y > 1 and self.grid_size_x > 1 and self.grid_size_z > 1
