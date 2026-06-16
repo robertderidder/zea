@@ -66,10 +66,11 @@ def simulate_rf(
     element_width,
     attenuation_coef,
     tx_apodizations,
+    scatterer_cell_size=None,
 ):
     """
-    Simulates a select number of rf_data points in the frequency domain for a given set of scatterers and probe geometry. 
-    
+    Simulates a select number of rf_data points in the frequency domain for a given set of scatterers and probe geometry.
+
 
     Args:
         scatterer_positions (array-like): The positions of the scatterers [m] of shape (n_scat, 3).
@@ -89,6 +90,15 @@ def simulate_rf(
         attenuation_coef (float): The attenuation coefficient [dB/cm/MHz].
         tx_apodizations (array-like): The apodizations of the transmitting elements of
             shape (n_tx, n_el).
+        scatterer_cell_size (array-like, optional): The (dz, dx) size [m] of the Riemann-sum
+            cell each scatterer represents, of shape (n_scat, 2). ``dz`` is the radial/axial
+            extent and ``dx`` the lateral extent. When given, each scatterer is treated as a
+            finite-size patch rather than a Dirac point: a `sinc`-shaped directivity term
+            (sized by ``dx``, mirroring the probe-element ``directivity``) suppresses lateral
+            grating lobes, and a `sinc`-shaped frequency roll-off (sized by ``dz``) accounts
+            for the spread of round-trip path lengths across the cell's depth. Both terms tend
+            to 1 as the cell shrinks, recovering the point-scatterer model. If ``None``
+            (default), scatterers are treated as ideal points (previous behaviour).
 
     Returns:
         fourier transform of the RF data of shape (n_tx, n_freq, n_el)
@@ -188,7 +198,36 @@ def simulate_rf(
     )
 
     spread_atten = spread(dist_total[..., None])
-    
+
+    if scatterer_cell_size is not None:
+        dz_cell = scatterer_cell_size[:, 0]
+        dx_cell = scatterer_cell_size[:, 1]
+
+        # Finite lateral extent: suppress grating lobes the same way the
+        # finite-width probe elements do, but sized by the scatterer cell.
+        cell_directivity_tx = directivity(
+            freqs[None, None, None],
+            theta_tx[..., None, None],
+            dx_cell[:, None, None, None],
+            sound_speed,
+        )
+        cell_directivity_rx = directivity(
+            freqs[None, None, None],
+            theta_rx[:, None, :, None],
+            dx_cell[:, None, None, None],
+            sound_speed,
+        )
+
+        # NOTE: an axial sinc term (sinc(f * dz * (cos_tx + cos_rx) / c)) was
+        # previously included here to model finite radial extent. It was removed
+        # because for typical grid spacings (dz ≈ 0.5–1.5 wavelengths), the
+        # sinc argument at center frequency falls past its first zero crossing
+        # (arg > 1), causing the forward model to produce near-zero signal with
+        # wrong sign — effectively killing the DPS gradient.
+        cell_response = cell_directivity_tx * cell_directivity_rx
+    else:
+        cell_response = 1.0
+
     def _simulate_single_tx(t0_delay_tx, initial_time_tx, tx_apodization_tx):
         tau_total = (dist_total / sound_speed) + t0_delay_tx[None, :, None] - initial_time_tx
 
@@ -206,7 +245,8 @@ def simulate_rf(
                 * directivity_tx
                 * directivity_rx
                 * attenuation
-                * spread_atten,
+                * spread_atten
+                * cell_response,
                 "complex64",
             )
         )
