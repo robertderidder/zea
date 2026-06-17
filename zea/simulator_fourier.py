@@ -67,6 +67,8 @@ def simulate_rf(
     attenuation_coef,
     tx_apodizations,
     scatterer_cell_size=None,
+    waveform=None,
+    waveform_sampling_frequency=None,
 ):
     """
     Simulates a select number of rf_data points in the frequency domain for a given set of scatterers and probe geometry.
@@ -99,6 +101,15 @@ def simulate_rf(
             for the spread of round-trip path lengths across the cell's depth. Both terms tend
             to 1 as the cell shrinks, recovering the point-scatterer model. If ``None``
             (default), scatterers are treated as ideal points (previous behaviour).
+        waveform (array-like, optional): A 1D measured transmit waveform of shape
+            (n_samp,) (e.g. ``scan.waveforms_two_way[0]``). When given, the simulator
+            multiplies each scatterer's response by this waveform's spectrum instead of
+            the default analytic Hann-windowed pulse, making the simulated pulse shape
+            match the real transducer. Requires ``waveform_sampling_frequency``. If
+            ``None`` (default), the analytic pulse is used (previous behaviour).
+        waveform_sampling_frequency (float, optional): The sampling rate [Hz] of
+            ``waveform`` (e.g. 250e6 for Verasonics waveforms). Only used when
+            ``waveform`` is given.
 
     Returns:
         fourier transform of the RF data of shape (n_tx, n_freq, n_el)
@@ -113,7 +124,12 @@ def simulate_rf(
 
     tx_apodizations = ops.take(tx_apodizations, tx_indices, axis=0)
 
-    pulse_spectrum_fn = get_pulse_spectrum_fn(center_frequency, n_period=4)
+    if waveform is None:
+        pulse_spectrum_fn = get_pulse_spectrum_fn(center_frequency, n_period=4)
+    else:
+        pulse_spectrum_fn = get_measured_waveform_spectrum_fn(
+            waveform, waveform_sampling_frequency
+        )
 
     if not apply_lens_correction:
         dist_tx = ops.linalg.norm(probe_geometry_tx[None] - scatterer_positions[:, None], axis=-1)
@@ -375,6 +391,64 @@ def get_pulse_spectrum_fn(center_frequency, n_period=3.0):
             (hann_fd(f - center_frequency, period) + hann_fd(f + center_frequency, period)),
             "complex64",
         )
+
+    return spectrum_fn
+
+
+def get_measured_waveform_spectrum_fn(waveform, waveform_sampling_frequency):
+    """Computes the spectrum of a *measured* transmit waveform.
+
+    Evaluates the discrete-time Fourier transform (DTFT) of the time-domain
+    waveform directly at the requested frequencies::
+
+        W(f) = sum_n w[n] * exp(-j 2 pi f n / fs_wave)
+
+    Evaluating the DTFT directly (rather than an FFT followed by interpolation)
+    lets us sample the spectrum at the simulator's arbitrary, per-step-subsampled
+    ``freqs`` and cleanly bridges the waveform's own sampling rate
+    (``waveform_sampling_frequency``, e.g. 250 MHz for Verasonics) and the RF
+    grid's sampling rate.
+
+    The waveform is used as-is (indexed from sample 0), so its intrinsic latency
+    is preserved through the phase of the spectrum. The result is normalized so
+    its peak magnitude over the band is ~1, matching the scale of the analytic
+    Hann pulse (:func:`get_pulse_spectrum_fn`) so the rest of the model
+    (omega/eps/magnitude_range tuning) is unaffected.
+
+    NOTE: only a single 1D waveform is supported. The current datasets use one
+    shared transmit waveform for all transmits; per-transmit selection via
+    ``tx_waveform_indices`` is a possible future extension.
+
+    Args:
+        waveform (array-like): 1D time-domain transmit waveform of shape (n_samp,).
+        waveform_sampling_frequency (float): Sampling rate of ``waveform`` [Hz].
+
+    Returns:
+        spectrum_fn (callable): A function mapping frequencies [Hz] to the complex
+        spectrum of the waveform.
+    """
+    assert waveform_sampling_frequency is not None, (
+        "waveform_sampling_frequency must be given when using a measured waveform."
+    )
+    waveform_np = np.asarray(waveform, dtype="float32").reshape(-1)
+
+    # Fixed normalization constant: the peak magnitude of the full-resolution
+    # spectrum. Computed once (not per-call) so the scale is stable regardless of
+    # which frequency subset is sampled in a given forward pass.
+    norm = float(np.max(np.abs(np.fft.rfft(waveform_np))))
+    norm = norm if norm > 0 else 1.0
+
+    waveform_t = ops.convert_to_tensor(waveform_np, dtype="float32")
+    sample_indices = ops.arange(waveform_np.shape[0], dtype="float32")
+
+    def spectrum_fn(f):
+        # arg has shape (..., n_freq, n_samp); exp(j*arg) is the DTFT basis.
+        arg = -2 * np.pi * f[..., None] * sample_indices / waveform_sampling_frequency
+        basis = ops.cast(ops.cos(arg), "complex64") + ops.cast(
+            1j, "complex64"
+        ) * ops.cast(ops.sin(arg), "complex64")
+        spectrum = ops.sum(ops.cast(waveform_t, "complex64") * basis, axis=-1)
+        return spectrum / ops.cast(norm, "complex64")
 
     return spectrum_fn
 

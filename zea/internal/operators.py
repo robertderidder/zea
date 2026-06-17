@@ -360,7 +360,9 @@ class Simulator(Operator):
                  n_random_beams = 0,
                  grid = None,
                  n_ax_min = 0,
-                 magnitude_range = (-320, 0)):
+                 magnitude_range = (-320, 0),
+                 waveform = None,
+                 waveform_sampling_frequency = None):
         super().__init__()
         self.scan = self.validate_scan(scan)
         self.n_tx_samples = scan.n_tx if n_tx_samples is None else n_tx_samples
@@ -368,12 +370,21 @@ class Simulator(Operator):
         self.n_freq_samples = self.n_freqs if n_freq_samples is None else n_freq_samples
         self.n_el_samples = scan.n_el if n_el_samples is None else n_el_samples
         self.scatterer_chunk_size = scatterer_chunk_size
+        # Optional measured transmit waveform. When None, simulate_rf uses the
+        # default analytic Hann pulse (previous behaviour).
+        self.waveform = waveform
+        self.waveform_sampling_frequency = waveform_sampling_frequency
         # dB range that image values in [-1, 1] map to before exp() -> linear amplitude.
         # A very wide range (e.g. 320 dB) makes the forward model blind to all but the
         # brightest pixels (exp(-16) ~ 0), so its gradient w.r.t. dark pixels vanishes and
         # DPS cannot reconstruct them. Match this to the data's actual dynamic range.
         self.magnitude_range = tuple(magnitude_range)
         self.beams = self.select_beams(n_equidistant_beams, n_random_beams)
+        # Scatterer grid resolution (grid_size_z, grid_size_x). The input image is
+        # resized to this in `forward`, so the image resolution (e.g. the diffusion
+        # model's native 112x112) is decoupled from the simulation grid resolution.
+        # Mirrors Simulator_Total; a resize to the image's own shape is a no-op.
+        self.shape = scan.grid.shape[:2]
         self.positions = scan.flatgrid if grid is None else grid if grid.ndim==2 else ValueError(f"grid should be 2D, but got shape {grid.shape}")
         self.cell_size = ops.convert_to_tensor(scan.flatgrid_cell_size, dtype="float32")
         self.cell_area = ops.convert_to_tensor(scan.flatgrid_cell_area, dtype="float32")
@@ -430,8 +441,10 @@ class Simulator(Operator):
 
     def forward(self, image, seed, freq_gaussian_probs=False):
         assert len(image.shape) == 4, "Image should have shape (B, H, W, C)"
+        # Resample the image onto the scatterer grid (no-op when already equal).
+        image = ops.image.resize(image, self.shape, interpolation="bilinear")
         seed_el, seed_freq, seed_tx = split_seed(seed, 3)
-        
+
         n_frames = image.shape[0]
         magnitudes = self.image_to_magnitudes(image, n_frames)
 
@@ -472,6 +485,8 @@ class Simulator(Operator):
                 element_width=self.scan.element_width,
                 attenuation_coef=self.scan.attenuation_coef,
                 tx_apodizations=self.scan.tx_apodizations,
+                waveform=self.waveform,
+                waveform_sampling_frequency=self.waveform_sampling_frequency,
             )
 
         @jax.checkpoint
@@ -522,10 +537,15 @@ class Simulator_Total(Operator):
              n_random_beams = 0,
              grid = None,
              n_ax_min = 0,
-             magnitude_range = (-320, 0)):
+             magnitude_range = (-320, 0),
+             waveform = None,
+             waveform_sampling_frequency = None):
         super().__init__()
         self.scan = self.validate_scan(scan)
         self.shape = scan.grid.shape[:2]
+        # Optional measured transmit waveform (see Simulator). None -> analytic pulse.
+        self.waveform = waveform
+        self.waveform_sampling_frequency = waveform_sampling_frequency
         self.n_tx_samples = scan.n_tx if n_tx_samples is None else n_tx_samples
         self.n_freqs = 2**int(ops.ceil(ops.log2(self.scan.n_ax-n_ax_min))) // 2 + 1
         self.n_freq_samples = self.n_freqs if n_freq_samples is None else n_freq_samples
@@ -655,6 +675,8 @@ class Simulator_Total(Operator):
                 element_width=self.scan.element_width,
                 attenuation_coef=self.scan.attenuation_coef,
                 tx_apodizations=self.scan.tx_apodizations,
+                waveform=self.waveform,
+                waveform_sampling_frequency=self.waveform_sampling_frequency,
             )
 
         @jax.checkpoint
