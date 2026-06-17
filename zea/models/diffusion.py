@@ -1034,7 +1034,7 @@ class DiffusionModel(DeepGenerativeModel):
             seed=seed1,
         )
 
-        out = self.image_from_rf(
+        out, optvars = self.image_from_rf(
             measurements=measurements,
             omega = omega,
             initial_noise=initial_noise,
@@ -1045,7 +1045,7 @@ class DiffusionModel(DeepGenerativeModel):
             **kwargs,
         )  # ( batch_size * n_samples, *self.input_shape)
 
-        return ops.reshape(out, shape)  # (batch_size, n_samples, *input_shape)
+        return ops.reshape(out, shape), optvars  # (batch_size, n_samples, *input_shape)
 
 
     def image_from_rf(
@@ -1073,6 +1073,13 @@ class DiffusionModel(DeepGenerativeModel):
         omega_optvars = kwargs.pop("omega_optvars", omega)
         optvars_with_adam = kwargs.pop("optvars_with_adam", False)
         optvars_adam_params = kwargs.pop("optvars_adam_params", None)
+        # Keep optvars frozen for the first `optvars_warmup_steps` reverse-diffusion
+        # steps so their measurement gradient is taken against an image that has begun
+        # to form, not near-noise (cf. INFER's 250-step sound-speed freeze). After
+        # warm-up the optvars step size decays geometrically by `optvars_lr_decay_rate`
+        # across the remaining steps (cf. INFER's optax.exponential_decay).
+        optvars_warmup_steps = kwargs.pop("optvars_warmup_steps", 0)
+        optvars_lr_decay_rate = kwargs.pop("optvars_lr_decay_rate", 1.0)
 
         with_clipping = kwargs.pop("with_clipping", False)
 
@@ -1154,7 +1161,7 @@ class DiffusionModel(DeepGenerativeModel):
                     grad_update = omega * gradients
 
                 if no_rev_diffusion:
-                    next_noisy_images = noisy_images - grad_update
+                    next_noisy_images = noisy_images
                 else:
                     next_noisy_images = self.reverse_diffusion_step(
                         shape=(num_images, *input_shape),
@@ -1189,6 +1196,8 @@ class DiffusionModel(DeepGenerativeModel):
                 (next_noisy_images, ops.zeros_like(initial_noise), seed, ops.zeros_like(initial_noise), (m, v)),
                 disable_jit=verbose or track_progress_type or disable_jit,
             )
+
+            optvars = None  # No optvars for DPS_SIM guidance
 
         elif isinstance(self.guidance_fn, DPS_SIM_TOT):
             beta1_optvars = 0.9
@@ -1240,6 +1249,23 @@ class DiffusionModel(DeepGenerativeModel):
                     **kwargs
                 )
 
+                # Warm-up: zero the optvars gradient until the image has begun to form.
+                # Done before Adam so its moment estimates are not polluted during warm-up.
+                optvars_active = ops.cast(step >= optvars_warmup_steps, "float32")
+                optvars_grads = jax.tree_util.tree_map(
+                    lambda g: g * optvars_active, optvars_grads
+                )
+                # Geometric step-size decay over the post-warm-up steps.
+                optvars_progress = ops.clip(
+                    (step - optvars_warmup_steps)
+                    / ops.maximum(diffusion_steps - optvars_warmup_steps, 1),
+                    0.0,
+                    1.0,
+                )
+                omega_optvars_t = omega_optvars * ops.power(
+                    ops.cast(optvars_lr_decay_rate, "float32"), optvars_progress
+                )
+
                 if with_adam:
                     m = beta1 * m + (1 - beta1) * img_grads
                     v = beta2 * v + (1 - beta2) * (img_grads**2)
@@ -1269,7 +1295,7 @@ class DiffusionModel(DeepGenerativeModel):
                         v_optvars,
                     )
                     optvars_grad_update = jax.tree_util.tree_map(
-                        lambda m_hat_leaf, v_hat_leaf: omega_optvars
+                        lambda m_hat_leaf, v_hat_leaf: omega_optvars_t
                         * m_hat_leaf
                         / (ops.sqrt(v_hat_leaf) + eps_optvars),
                         m_hat_optvars,
@@ -1277,7 +1303,7 @@ class DiffusionModel(DeepGenerativeModel):
                     )
                 else:
                     optvars_grad_update = jax.tree_util.tree_map(
-                        lambda g: omega_optvars * g,
+                        lambda g: omega_optvars_t * g,
                         optvars_grads,
                     )
 
@@ -1287,16 +1313,19 @@ class DiffusionModel(DeepGenerativeModel):
                     optvars_grad_update,
                 )
 
-                next_noisy_images = self.reverse_diffusion_step(
-                    shape=(num_images, *input_shape),
-                    pred_images=pred_images,
-                    pred_noises=pred_noises,
-                    signal_rates=signal_rates,
-                    next_signal_rates=next_signal_rates,
-                    next_noise_rates=next_noise_rates,
-                    seed=seed2,
-                    stochastic_sampling=stochastic_sampling,
-                )
+                if no_rev_diffusion:
+                    next_noisy_images = noisy_images
+                else:
+                    next_noisy_images = self.reverse_diffusion_step(
+                        shape=(num_images, *input_shape),
+                        pred_images=pred_images,
+                        pred_noises=pred_noises,
+                        signal_rates=signal_rates,
+                        next_signal_rates=next_signal_rates,
+                        next_noise_rates=next_noise_rates,
+                        seed=seed2,
+                        stochastic_sampling=stochastic_sampling,
+                    )
                 next_noisy_images = next_noisy_images - image_grad_update
                 pred_images = pred_images - image_grad_update
 
@@ -1338,7 +1367,7 @@ class DiffusionModel(DeepGenerativeModel):
         else:
             raise ValueError("Unsupported guidance function type for image_from_rf")
         
-        return pred_images
+        return pred_images, optvars
         
 
 register_presets(diffusion_model_presets, DiffusionModel)

@@ -359,7 +359,8 @@ class Simulator(Operator):
                  n_equidistant_beams = 0,
                  n_random_beams = 0,
                  grid = None,
-                 n_ax_min = 0):
+                 n_ax_min = 0,
+                 magnitude_range = (-320, 0)):
         super().__init__()
         self.scan = self.validate_scan(scan)
         self.n_tx_samples = scan.n_tx if n_tx_samples is None else n_tx_samples
@@ -367,6 +368,11 @@ class Simulator(Operator):
         self.n_freq_samples = self.n_freqs if n_freq_samples is None else n_freq_samples
         self.n_el_samples = scan.n_el if n_el_samples is None else n_el_samples
         self.scatterer_chunk_size = scatterer_chunk_size
+        # dB range that image values in [-1, 1] map to before exp() -> linear amplitude.
+        # A very wide range (e.g. 320 dB) makes the forward model blind to all but the
+        # brightest pixels (exp(-16) ~ 0), so its gradient w.r.t. dark pixels vanishes and
+        # DPS cannot reconstruct them. Match this to the data's actual dynamic range.
+        self.magnitude_range = tuple(magnitude_range)
         self.beams = self.select_beams(n_equidistant_beams, n_random_beams)
         self.positions = scan.flatgrid if grid is None else grid if grid.ndim==2 else ValueError(f"grid should be 2D, but got shape {grid.shape}")
         self.cell_size = ops.convert_to_tensor(scan.flatgrid_cell_size, dtype="float32")
@@ -378,7 +384,6 @@ class Simulator(Operator):
         self.cell_area = self.cell_area / ops.mean(self.cell_area)
         self.initial_time_offset = n_ax_min / self.scan.sampling_frequency
         self.n_ax_min = n_ax_min
-        self.tcg = self.scan.tgc_gain_curve
 
     def select_beams(self, n_equidistant, n_random):
         #Assert both integers
@@ -407,8 +412,8 @@ class Simulator(Operator):
         return _validate_scan(scan)
 
     def image_to_magnitudes(self, image, n_frames):
-        assert image.max() < 1.01 and image.min() > -1.01, "Image values should be in the range [-1, 1]. got (min, max) = ({image.min()}, {image.max()})"  
-        image = translate(image, range_from=(-1,1), range_to=(-320,0))
+        assert image.max() < 1.01 and image.min() > -1.01, "Image values should be in the range [-1, 1]. got (min, max) = ({image.min()}, {image.max()})"
+        image = translate(image, range_from=(-1,1), range_to=self.magnitude_range)
         image = ops.reshape(image, (n_frames, -1))
         image_lin  = ops.exp(image/20) #Means values between 0 and 6.4.
         # Riemann-sum area weighting: each scatterer represents a grid cell of area
@@ -450,7 +455,7 @@ class Simulator(Operator):
             return simulate_rf(
                 scatterer_positions=pos_chunk,
                 scatterer_magnitudes=mag_chunk,
-                scatterer_cell_size=cell_chunk,
+                # scatterer_cell_size=cell_chunk,
                 el_indices=el_indices,
                 freq_indices=freq_indices,
                 tx_indices=tx_indices,
@@ -516,7 +521,8 @@ class Simulator_Total(Operator):
              n_equidistant_beams = 0,
              n_random_beams = 0,
              grid = None,
-             n_ax_min = 0):
+             n_ax_min = 0,
+             magnitude_range = (-320, 0)):
         super().__init__()
         self.scan = self.validate_scan(scan)
         self.shape = scan.grid.shape[:2]
@@ -526,6 +532,8 @@ class Simulator_Total(Operator):
         self.n_el_samples = scan.n_el if n_el_samples is None else n_el_samples
         self.scatterer_chunk_size = scatterer_chunk_size
         self.sound_speed_offset_scale = sound_speed_offset_scale
+        # See Simulator.magnitude_range: dB range mapped to before exp() -> amplitude.
+        self.magnitude_range = tuple(magnitude_range)
         base_positions = scan.flatgrid if grid is None else grid
         self.positions = base_positions + 2 * position_offset_wl * (keras.random.uniform(shape=base_positions.shape, seed=42)-ops.ones_like(base_positions)*0.5)* scan.wavelength
         self.cell_size = ops.convert_to_tensor(scan.flatgrid_cell_size, dtype="float32")
@@ -543,26 +551,30 @@ class Simulator_Total(Operator):
         return _validate_scan(scan)
 
     def select_beams(self, n_equidistant, n_random):
+        assert isinstance(n_equidistant, int) or n_equidistant == "all", "n_equidistant_beams should be an integer or 'all'"
+        assert isinstance(n_random, int) or n_random == "all", "n_random_beams should be an integer or 'all'"
         if n_equidistant == "all" or n_random == "all":
             return ops.arange(self.scan.n_tx, dtype="int32")
-
-        if n_equidistant == 0 and n_random == 0:
+        elif n_equidistant == 0 and n_random == 0:
             raise ValueError("At least one of n_equidistant_beams or n_random_beams must be greater than 0.")
-        if n_equidistant > 0 and n_random > 0:
+        elif n_equidistant > 0 and n_random > 0:
             raise ValueError("n_equidistant_beams and n_random_beams cannot both be greater than 0. Please choose one sampling strategy.")
-        if n_equidistant > 0:
+        elif n_equidistant > 0:
             #choose n equidistant transmits from the scan
             beams = ops.linspace(0, self.scan.n_tx-1, n_equidistant, dtype="int32")
-        if n_random > 0:
+        elif n_random > 0:
             #choose n random transmits from the scan
             beams = ops.random.shuffle(ops.arange(self.scan.n_tx, dtype="int32"))[:n_random]
+        else:
+            raise ValueError("Invalid beam selection strategy. Please check n_equidistant_beams and n_random_beams parameters.")
+
         if self.n_tx_samples > len(beams):
             raise ValueError(f"n_tx_samples ({self.n_tx_samples}) cannot be greater than the number of selected beams ({len(beams)}). Please adjust n_tx_samples or the beam selection strategy.")
         return beams
 
     def image_to_magnitudes(self, image, n_frames):
         """Convert a (resized) image into scatterer magnitudes. Mirrors `Simulator.image_to_magnitudes`."""
-        image = translate(image, range_from=(-1,1), range_to=(-320,0))
+        image = translate(image, range_from=(-1,1), range_to=self.magnitude_range)
         image = ops.reshape(image, (n_frames, -1))
         image_lin = ops.exp(image/20)
         # Riemann-sum area weighting, see `Simulator.image_to_magnitudes`.
@@ -626,7 +638,7 @@ class Simulator_Total(Operator):
             return simulate_rf(
                 scatterer_positions=pos_chunk,
                 scatterer_magnitudes=mag_chunk,
-                scatterer_cell_size=cell_chunk,
+                # scatterer_cell_size=cell_chunk,
                 el_indices=el_indices,
                 freq_indices=freq_indices,
                 tx_indices=tx_indices,
