@@ -538,11 +538,18 @@ class Simulator_Total(Operator):
              grid = None,
              n_ax_min = 0,
              magnitude_range = (-320, 0),
+             enable_wavelength_scaling = False,
              waveform = None,
              waveform_sampling_frequency = None):
         super().__init__()
         self.scan = self.validate_scan(scan)
         self.shape = scan.grid.shape[:2]
+        # When True, the scatterer grid is parameterized in wavelengths and scales with
+        # the (optimized) sound speed: a higher sound speed moves every scatterer outward
+        # so round-trip travel times stay ~constant. This keeps the loss landscape in
+        # `sound_speed_offset` smooth instead of phase-wrapping, which is what makes joint
+        # sound-speed optimization converge (cf. off-grid-ultrasound reparameterize_scat_pos).
+        self.enable_wavelength_scaling = enable_wavelength_scaling
         # Optional measured transmit waveform (see Simulator). None -> analytic pulse.
         self.waveform = waveform
         self.waveform_sampling_frequency = waveform_sampling_frequency
@@ -556,6 +563,13 @@ class Simulator_Total(Operator):
         self.magnitude_range = tuple(magnitude_range)
         base_positions = scan.flatgrid if grid is None else grid
         self.positions = base_positions + 2 * position_offset_wl * (keras.random.uniform(shape=base_positions.shape, seed=42)-ops.ones_like(base_positions)*0.5)* scan.wavelength
+        # Reference wavelength at the unperturbed sound speed, and the grid expressed in
+        # wavelength units. When sound speed is optimized, the physical positions are
+        # rebuilt as positions_wl * (new) wavelength (see reparameterize_optvars). At the
+        # default sound_speed_offset == 0 this returns exactly self.positions, so the
+        # operator still matches Simulator with default optvars.
+        self.base_wavelength = self.scan.sound_speed / self.scan.center_frequency
+        self.positions_wl = self.positions / self.base_wavelength
         self.cell_size = ops.convert_to_tensor(scan.flatgrid_cell_size, dtype="float32")
         self.cell_area = ops.convert_to_tensor(scan.flatgrid_cell_area, dtype="float32")
         # Normalize so the mean weight is 1: preserves the *relative* per-scatterer
@@ -606,6 +620,14 @@ class Simulator_Total(Operator):
         With ``optvars["position_offset"]`` all zeros and ``optvars["sound_speed_offset"]``
         equal to ``0.0`` (the defaults), this reduces to `self.positions` and
         `self.scan.sound_speed`, matching `Simulator`.
+
+        When ``enable_wavelength_scaling`` is True, the whole scatterer grid is defined in
+        wavelengths and rebuilt at the current (optimized) wavelength, so increasing the
+        sound speed moves every scatterer outward in proportion. This keeps the dominant
+        round-trip travel time ``dist/c`` ~constant as ``c`` varies, so the measurement
+        error is smooth in ``sound_speed_offset`` (no phase wrapping) and joint sound-speed
+        optimization converges. With it False the grid is fixed in metres and only the
+        per-scatterer ``position_offset`` moves (the previous, poorly-conditioned behaviour).
         """
         out = dict(optvars)
 
@@ -617,10 +639,18 @@ class Simulator_Total(Operator):
 
         wavelength = sound_speed / self.scan.center_frequency
 
-        positions = self.positions + (
-            out["position_offset"] * wavelength
-            if "position_offset" in out
+        # Per-scatterer offset, in wavelengths (zeros by default).
+        position_offset_wl = (
+            out["position_offset"] if "position_offset" in out
             else ops.zeros_like(self.positions))
+
+        if self.enable_wavelength_scaling:
+            # Grid (and offset) are in wavelengths -> scale to metres at the current
+            # wavelength. At sound_speed_offset == 0 this is exactly self.positions
+            # (+ offset * base_wavelength), preserving the Simulator equivalence.
+            positions = (self.positions_wl + position_offset_wl) * wavelength
+        else:
+            positions = self.positions + position_offset_wl * wavelength
 
         return positions, sound_speed
 
