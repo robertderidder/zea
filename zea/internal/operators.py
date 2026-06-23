@@ -386,13 +386,6 @@ class Simulator(Operator):
         # Mirrors Simulator_Total; a resize to the image's own shape is a no-op.
         self.shape = scan.grid.shape[:2]
         self.positions = scan.flatgrid if grid is None else grid if grid.ndim==2 else ValueError(f"grid should be 2D, but got shape {grid.shape}")
-        self.cell_size = ops.convert_to_tensor(scan.flatgrid_cell_size, dtype="float32")
-        self.cell_area = ops.convert_to_tensor(scan.flatgrid_cell_area, dtype="float32")
-        # Normalize so the mean weight is 1: preserves the *relative* per-scatterer
-        # area weighting (e.g. far-field cells vs. near-apex cells on a polar grid)
-        # while keeping the overall output scale compatible with omega/eps, which
-        # were tuned without any area weighting.
-        self.cell_area = self.cell_area / ops.mean(self.cell_area)
         self.initial_time_offset = n_ax_min / self.scan.sampling_frequency
         self.n_ax_min = n_ax_min
 
@@ -413,10 +406,7 @@ class Simulator(Operator):
         image = translate(image, range_from=(-1,1), range_to=self.magnitude_range)
         image = ops.reshape(image, (n_frames, -1))
         image_lin  = ops.exp(image/20) #Means values between 0 and 6.4.
-        # Riemann-sum area weighting: each scatterer represents a grid cell of area
-        # self.cell_area, not a point, so its contribution must scale with that area
-        # for the discretization to converge as grid_size changes.
-        return image_lin * self.cell_area[None, :]
+        return image_lin
 
     def _get_indices(self, seed_el, seed_freq, seed_tx, freq_gaussian_probs):
         return _sample_indices(
@@ -456,16 +446,13 @@ class Simulator(Operator):
         # Pad and pre-reshape positions into (n_chunks, chunk_size, 3)
         positions_padded = ops.pad(self.positions, ((0, n_scat_padded - n_scat), (0, 0)))
         position_chunks = ops.reshape(positions_padded, (n_chunks, chunk_size, 3))
-        cell_size_padded = ops.pad(self.cell_size, ((0, n_scat_padded - n_scat), (0, 0)))
-        cell_size_chunks = ops.reshape(cell_size_padded, (n_chunks, chunk_size, 2))
         magnitudes_padded = ops.pad(magnitudes, ((0, 0), (0, n_scat_padded - n_scat)))
 
-        def simulate_chunk(pos_chunk, mag_chunk, cell_chunk):
+        def simulate_chunk(pos_chunk, mag_chunk):
             """Simulate RF for a single scatterer chunk."""
             return simulate_rf(
                 scatterer_positions=pos_chunk,
                 scatterer_magnitudes=mag_chunk,
-                # scatterer_cell_size=cell_chunk,
                 el_indices=el_indices,
                 freq_indices=freq_indices,
                 tx_indices=tx_indices,
@@ -488,15 +475,15 @@ class Simulator(Operator):
 
         @jax.checkpoint
         def accumulate_chunks(rf_accumulated, chunk):
-            pos_chunk, mag_chunk, cell_chunk = chunk
-            rf_accumulated = rf_accumulated + simulate_chunk(pos_chunk, mag_chunk, cell_chunk)
+            pos_chunk, mag_chunk = chunk
+            rf_accumulated = rf_accumulated + simulate_chunk(pos_chunk, mag_chunk)
             return rf_accumulated, None
 
         @jax.checkpoint
         def process_frame(carry, frame_data):
             magnitude_chunks = ops.reshape(frame_data, (n_chunks, chunk_size))
             rf_init = ops.zeros((self.n_tx_samples, self.n_freq_samples, self.n_el_samples, 1), dtype='complex64')
-            rf_accumulated, _ = ops.scan(accumulate_chunks, rf_init, (position_chunks, magnitude_chunks, cell_size_chunks))
+            rf_accumulated, _ = ops.scan(accumulate_chunks, rf_init, (position_chunks, magnitude_chunks))
             return carry, rf_accumulated
 
         _, rf_data = ops.scan(process_frame, None, magnitudes_padded)
@@ -568,12 +555,10 @@ class Simulator_Total(Operator):
         self.base_wavelength = self.scan.sound_speed / self.scan.center_frequency
         self.positions_wl = self.positions / self.base_wavelength
         self.cell_size = ops.convert_to_tensor(scan.flatgrid_cell_size, dtype="float32")
-        self.cell_area = ops.convert_to_tensor(scan.flatgrid_cell_area, dtype="float32")
         # Normalize so the mean weight is 1: preserves the *relative* per-scatterer
         # area weighting (e.g. far-field cells vs. near-apex cells on a polar grid)
         # while keeping the overall output scale compatible with omega/eps, which
         # were tuned without any area weighting.
-        self.cell_area = self.cell_area / ops.mean(self.cell_area)
         self.beams = self.select_beams(n_equidistant_beams, n_random_beams)
         self.initial_time_offset = n_ax_min / self.scan.sampling_frequency
         self.n_ax_min = n_ax_min
@@ -609,7 +594,7 @@ class Simulator_Total(Operator):
         image = ops.reshape(image, (n_frames, -1))
         image_lin = ops.exp(image/20)
         # Riemann-sum area weighting, see `Simulator.image_to_magnitudes`.
-        return image_lin * self.cell_area[None, :]
+        return image_lin
 
     def reparameterize_optvars(self, optvars):
         """Reparameterize the position and sound speed optimization variables.
@@ -676,16 +661,13 @@ class Simulator_Total(Operator):
         #pad and reshape positions, cell sizes and magnitudes for chunking
         positions_padded = ops.pad(positions, ((0, n_scat_padded - n_scat), (0, 0)))
         position_chunks = ops.reshape(positions_padded, (n_chunks, chunk_size, 3))
-        cell_size_padded = ops.pad(self.cell_size, ((0, n_scat_padded - n_scat), (0, 0)))
-        cell_size_chunks = ops.reshape(cell_size_padded, (n_chunks, chunk_size, 2))
         magnitudes_padded = ops.pad(magnitudes, ((0, 0), (0, n_scat_padded - n_scat)))
 
-        def simulate_chunk(pos_chunk, mag_chunk, cell_chunk):
+        def simulate_chunk(pos_chunk, mag_chunk):
             """Simulate RF for a single scatterer chunk."""
             return simulate_rf(
                 scatterer_positions=pos_chunk,
                 scatterer_magnitudes=mag_chunk,
-                # scatterer_cell_size=cell_chunk,
                 el_indices=el_indices,
                 freq_indices=freq_indices,
                 tx_indices=tx_indices,
@@ -708,15 +690,15 @@ class Simulator_Total(Operator):
 
         @jax.checkpoint
         def accumulate_chunks(rf_accumulated, chunk):
-            pos_chunk, mag_chunk, cell_chunk = chunk
-            rf_accumulated = rf_accumulated + simulate_chunk(pos_chunk, mag_chunk, cell_chunk)
+            pos_chunk, mag_chunk = chunk
+            rf_accumulated = rf_accumulated + simulate_chunk(pos_chunk, mag_chunk)
             return rf_accumulated, None
 
         @jax.checkpoint
         def process_frame(carry, frame_data):
             magnitude_chunks = ops.reshape(frame_data, (n_chunks, chunk_size))
             rf_init = ops.zeros((self.n_tx_samples, self.n_freq_samples, self.n_el_samples, 1), dtype='complex64')
-            rf_accumulated, _ = ops.scan(accumulate_chunks, rf_init, (position_chunks, magnitude_chunks, cell_size_chunks))
+            rf_accumulated, _ = ops.scan(accumulate_chunks, rf_init, (position_chunks, magnitude_chunks))
             return carry, rf_accumulated
 
         _, rf_data = ops.scan(process_frame, None, magnitudes_padded)
@@ -762,13 +744,10 @@ class Simlator_Time(Operator):
         self.sound_speed_offset_scale = sound_speed_offset_scale
         base_positions = scan.flatgrid if grid is None else grid
         self.positions = base_positions + 2 * position_offset_wl * (keras.random.uniform(shape=base_positions.shape, seed=42)-ops.ones_like(base_positions)*0.5)* scan.wavelength
-        self.cell_size = ops.convert_to_tensor(scan.flatgrid_cell_size, dtype="float32")
-        self.cell_area = ops.convert_to_tensor(scan.flatgrid_cell_area, dtype="float32")
         # Normalize so the mean weight is 1: preserves the *relative* per-scatterer
         # area weighting (e.g. far-field cells vs. near-apex cells on a polar grid)
         # while keeping the overall output scale compatible with omega/eps, which
         # were tuned without any area weighting.
-        self.cell_area = self.cell_area / ops.mean(self.cell_area)
         self.beams = self.select_beams(n_equidistant_beams, n_random_beams)
         self.initial_time_offset = n_ax_min / self.scan.sampling_frequency
         self.n_ax_min = n_ax_min
@@ -859,8 +838,6 @@ class Simlator_Time(Operator):
         #pad and reshape positions, cell sizes and magnitudes for chunking
         positions_padded = ops.pad(positions, ((0, n_scat_padded - n_scat), (0, 0)))
         position_chunks = ops.reshape(positions_padded, (n_chunks, chunk_size, 3))
-        cell_size_padded = ops.pad(self.cell_size, ((0, n_scat_padded - n_scat), (0, 0)))
-        cell_size_chunks = ops.reshape(cell_size_padded, (n_chunks, chunk_size, 2))
         magnitudes_padded = ops.pad(magnitudes, ((0, 0), (0, n_scat_padded - n_scat)))
 
         def simulate_chunk(pos_chunk, mag_chunk, cell_chunk):
@@ -868,7 +845,6 @@ class Simlator_Time(Operator):
             return simulate_partial_rf_data(
                 scatterer_positions=pos_chunk,
                 scatterer_magnitudes=mag_chunk,
-                scatterer_cell_size=cell_chunk,
                 el_indices=el_indices,
                 ax_indices=ax_indices,
                 tx_indices=tx_indices,
@@ -889,15 +865,15 @@ class Simlator_Time(Operator):
 
         @jax.checkpoint
         def accumulate_chunks(rf_accumulated, chunk):
-            pos_chunk, mag_chunk, cell_chunk = chunk
-            rf_accumulated = rf_accumulated + simulate_chunk(pos_chunk, mag_chunk, cell_chunk)
+            pos_chunk, mag_chunk = chunk
+            rf_accumulated = rf_accumulated + simulate_chunk(pos_chunk, mag_chunk)
             return rf_accumulated, None
 
         @jax.checkpoint
         def process_frame(carry, frame_data):
             magnitude_chunks = ops.reshape(frame_data, (n_chunks, chunk_size))
             rf_init = ops.zeros((self.n_tx_samples, self.n_freq_samples, self.n_el_samples, 1), dtype='complex64')
-            rf_accumulated, _ = ops.scan(accumulate_chunks, rf_init, (position_chunks, magnitude_chunks, cell_size_chunks))
+            rf_accumulated, _ = ops.scan(accumulate_chunks, rf_init, (position_chunks, magnitude_chunks))
             return carry, rf_accumulated
 
         _, rf_data = ops.scan(process_frame, None, magnitudes_padded)
