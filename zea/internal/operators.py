@@ -356,8 +356,8 @@ class Simulator(Operator):
                  n_freq_samples,
                  n_el_samples,
                  scatterer_chunk_size = 256,
-                 n_equidistant_beams = 0,
-                 n_random_beams = 0,
+                 n_equidistant_beams = None,
+                 n_random_beams = None,
                  grid = None,
                  n_ax_min = 0,
                  magnitude_range = (-320, 0),
@@ -397,26 +397,12 @@ class Simulator(Operator):
         self.n_ax_min = n_ax_min
 
     def select_beams(self, n_equidistant, n_random):
-        #Assert both integers
-        assert isinstance(n_equidistant, int) or n_equidistant == "all", "n_equidistant_beams should be an integer or 'all'"
-        assert isinstance(n_random, int) or n_random == "all", "n_random_beams should be an integer or 'all'"
-        if n_equidistant == "all" or n_random == "all":
-            return ops.arange(self.scan.n_tx, dtype="int32")
-        elif n_equidistant == 0 and n_random == 0:
-            raise ValueError("At least one of n_equidistant_beams or n_random_beams must be greater than 0.")
-        elif n_equidistant > 0 and n_random > 0:
-            raise ValueError("n_equidistant_beams and n_random_beams cannot both be greater than 0. Please choose one sampling strategy.")
-        elif n_equidistant > 0:
-            #choose n equidistant transmits from the scan
-            beams = ops.linspace(0, self.scan.n_tx-1, n_equidistant, dtype="int32")
-        elif n_random > 0:
-            #choose n random transmits from the scan
-            beams = ops.random.shuffle(ops.arange(self.scan.n_tx, dtype="int32"))[:n_random]
-        else: #
-            raise ValueError("Invalid beam selection strategy. Please check n_equidistant_beams and n_random_beams parameters.")
-        
-        if self.n_tx_samples > len(beams):
-            raise ValueError(f"n_tx_samples ({self.n_tx_samples}) cannot be greater than the number of selected beams ({len(beams)}). Please adjust n_tx_samples or the beam selection strategy.")
+        if n_equidistant is None and n_random is None:
+            beams = ops.arange(self.scan.n_tx, dtype="int32")
+        else:
+            log.warning("Beam selection is deprecated. Please use scan.set_transmits() to select transmits instead.")
+            log.info("selecting all beams")
+            beams = ops.arange(self.scan.n_tx, dtype="int32")
         return beams
     
     def validate_scan(self, scan):
@@ -439,14 +425,25 @@ class Simulator(Operator):
             seed_el, seed_freq, seed_tx, freq_gaussian_probs,
         )
 
-    def forward(self, image, seed, freq_gaussian_probs=False):
-        assert len(image.shape) == 4, "Image should have shape (B, H, W, C)"
-        # Resample the image onto the scatterer grid (no-op when already equal).
-        image = ops.image.resize(image, self.shape, interpolation="bilinear")
+    def forward(self, image, seed, freq_gaussian_probs=False, linearized=False):
         seed_el, seed_freq, seed_tx = split_seed(seed, 3)
 
-        n_frames = image.shape[0]
-        magnitudes = self.image_to_magnitudes(image, n_frames)
+        if linearized:
+            # `image` is already a (n_frames, n_scat) array of (area-weighted) scatterer
+            # magnitudes — skip the resize + image_to_magnitudes mapping entirely. May be
+            # complex (per-scatterer phase); the rest of the pipeline is complex-safe.
+            assert image.ndim == 2, (
+                "linearized=True expects magnitudes of shape (n_frames, n_scat), "
+                f"got {image.shape}"
+            )
+            n_frames = image.shape[0]
+            magnitudes = image
+        else:
+            assert len(image.shape) == 4, "Image should have shape (B, H, W, C)"
+            # Resample the image onto the scatterer grid (no-op when already equal).
+            image = ops.image.resize(image, self.shape, interpolation="bilinear")
+            n_frames = image.shape[0]
+            magnitudes = self.image_to_magnitudes(image, n_frames)
 
         el_indices, freq_indices, tx_indices = self._get_indices(seed_el, seed_freq, seed_tx, freq_gaussian_probs)
 
