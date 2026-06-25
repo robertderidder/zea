@@ -546,14 +546,28 @@ class Scan(Parameters):
             self._invalidate("selected_transmits")
             return self
 
-        if selection == "focused":
+        if "focused" in selection:
             value = self._params.get("focus_distances")
             if value is None:
                 raise ValueError("No focus distances provided, cannot select focused transmits")
-            idx = np.where(value > 0)[0].tolist()
+            idx = np.where(value > 0)[0]
             if len(idx) == 0:
                 raise ValueError("No focused transmits found.")
-            self._params["selected_transmits"] = idx
+
+            #Assumption is that there is a number written after the word focused, which is the number of transmits to select
+            # can be 1 digit (9) or 2 digits (15) so we need to cut off the first 7 characters of the string and convert the rest to an integer
+            if len(selection) > 7:
+                try:
+                    n_transmits = int(selection[7:])
+                    subset = np.linspace(0, len(idx) - 1, n_transmits)
+                    subset = np.rint(subset).astype(int)
+                except ValueError:
+                    raise ValueError(f"Invalid focused transmit selection: {selection}")
+            else:
+                subset = np.arange(len(idx))  # If no number is provided, select all focused transmits
+            
+            #select evenly spaced transmits from idx
+            self._params["selected_transmits"] = idx[subset].tolist()
             self._invalidate("selected_transmits")
             return self
 
@@ -561,10 +575,21 @@ class Scan(Parameters):
             value = self._params.get("focus_distances")
             if value is None:
                 raise ValueError("No focus distances provided, cannot select diverging transmits")
-            idx = np.where(value < 0)[0].tolist()
+            idx = np.where(value < 0)[0]
             if len(idx) == 0:
                 raise ValueError("No diverging transmits found.")
-            self._params["selected_transmits"] = idx
+
+            if len(selection) > 9:
+                try:
+                    n_transmits = int(selection[9:])
+                    subset = np.linspace(0, len(idx) - 1, n_transmits)
+                    subset = np.rint(subset).astype(int)
+                except ValueError:
+                    raise ValueError(f"Invalid diverging transmit selection: {selection}")
+            else:
+                subset = np.arange(len(idx))  # If no number is provided, select all diverging transmits
+
+            self._params["selected_transmits"] = idx[subset].tolist()
             self._invalidate("selected_transmits")
             return self
 
@@ -572,10 +597,20 @@ class Scan(Parameters):
             value = self._params.get("focus_distances")
             if value is None:
                 raise ValueError("No focus distances provided, cannot select plane wave transmits")
-            idx = np.concatenate([np.where(value == 0)[0], np.where(np.isinf(value))[0]]).tolist()
+            idx = np.concatenate([np.where(value == 0)[0], np.where(np.isinf(value))[0]])
             if len(idx) == 0:
                 raise ValueError("No plane wave transmits found.")
-            self._params["selected_transmits"] = idx
+
+            if len(selection) > 5:
+                try:
+                    n_transmits = int(selection[5:])
+                    subset = np.linspace(0, len(idx) - 1, n_transmits)
+                    subset = np.rint(subset).astype(int)
+                except ValueError:
+                    raise ValueError(f"Invalid plane transmit selection: {selection}")
+            else:
+                subset = np.arange(len(idx))  # If no number is provided, select all plane wave transmits
+            self._params["selected_transmits"] = idx[subset].tolist()
             self._invalidate("selected_transmits")
             return self
 
