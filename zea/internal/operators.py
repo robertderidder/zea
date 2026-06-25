@@ -447,9 +447,15 @@ class Simulator(Operator):
         positions_padded = ops.pad(self.positions, ((0, n_scat_padded - n_scat), (0, 0)))
         position_chunks = ops.reshape(positions_padded, (n_chunks, chunk_size, 3))
         magnitudes_padded = ops.pad(magnitudes, ((0, 0), (0, n_scat_padded - n_scat)))
+        # (n_chunks, n_frames, chunk_size): each scan step processes all frames for one
+        # scatterer chunk, so the (frame-independent) kernel is built once and contracted
+        # against every frame's magnitudes in a single pass.
+        magnitude_chunks = ops.transpose(
+            ops.reshape(magnitudes_padded, (n_frames, n_chunks, chunk_size)), (1, 0, 2)
+        )
 
         def simulate_chunk(pos_chunk, mag_chunk):
-            """Simulate RF for a single scatterer chunk."""
+            """Simulate RF for a single scatterer chunk (all frames). mag_chunk: (n_frames, chunk)."""
             return simulate_rf(
                 scatterer_positions=pos_chunk,
                 scatterer_magnitudes=mag_chunk,
@@ -473,20 +479,20 @@ class Simulator(Operator):
                 waveform_sampling_frequency=self.waveform_sampling_frequency,
             )
 
-        @jax.checkpoint
+        # No @jax.checkpoint: magnitudes are factored out of the kernel (see simulate_rf), so
+        # the only intermediate the backward pass needs is the small post-`tx_el`-sum kernel,
+        # which `scan` stores per chunk (~GBs, well within VRAM). This avoids recomputing the
+        # full forward simulation in the gradient pass.
         def accumulate_chunks(rf_accumulated, chunk):
             pos_chunk, mag_chunk = chunk
             rf_accumulated = rf_accumulated + simulate_chunk(pos_chunk, mag_chunk)
             return rf_accumulated, None
 
-        @jax.checkpoint
-        def process_frame(carry, frame_data):
-            magnitude_chunks = ops.reshape(frame_data, (n_chunks, chunk_size))
-            rf_init = ops.zeros((self.n_tx_samples, self.n_freq_samples, self.n_el_samples, 1), dtype='complex64')
-            rf_accumulated, _ = ops.scan(accumulate_chunks, rf_init, (position_chunks, magnitude_chunks))
-            return carry, rf_accumulated
-
-        _, rf_data = ops.scan(process_frame, None, magnitudes_padded)
+        rf_init = ops.zeros(
+            (n_frames, self.n_tx_samples, self.n_freq_samples, self.n_el_samples, 1),
+            dtype='complex64',
+        )
+        rf_data, _ = ops.scan(accumulate_chunks, rf_init, (position_chunks, magnitude_chunks))
 
         return rf_data, tx_indices, freq_indices, el_indices
 
@@ -662,9 +668,13 @@ class Simulator_Total(Operator):
         positions_padded = ops.pad(positions, ((0, n_scat_padded - n_scat), (0, 0)))
         position_chunks = ops.reshape(positions_padded, (n_chunks, chunk_size, 3))
         magnitudes_padded = ops.pad(magnitudes, ((0, 0), (0, n_scat_padded - n_scat)))
+        # (n_chunks, n_frames, chunk_size): all frames per chunk (see Simulator.forward).
+        magnitude_chunks = ops.transpose(
+            ops.reshape(magnitudes_padded, (n_frames, n_chunks, chunk_size)), (1, 0, 2)
+        )
 
         def simulate_chunk(pos_chunk, mag_chunk):
-            """Simulate RF for a single scatterer chunk."""
+            """Simulate RF for a single scatterer chunk (all frames). mag_chunk: (n_frames, chunk)."""
             return simulate_rf(
                 scatterer_positions=pos_chunk,
                 scatterer_magnitudes=mag_chunk,
@@ -688,20 +698,22 @@ class Simulator_Total(Operator):
                 waveform_sampling_frequency=self.waveform_sampling_frequency,
             )
 
+        # Kept @jax.checkpoint here (unlike Simulator): this operator also optimizes
+        # `position_offset` / `sound_speed_offset`, whose gradients flow THROUGH the kernel
+        # build (positions/sound_speed enter the transcendental terms), so the backward needs
+        # the large per-chunk intermediates. Rematerializing them per chunk bounds memory on
+        # large grids. Magnitude factoring + frame batching still apply.
         @jax.checkpoint
         def accumulate_chunks(rf_accumulated, chunk):
             pos_chunk, mag_chunk = chunk
             rf_accumulated = rf_accumulated + simulate_chunk(pos_chunk, mag_chunk)
             return rf_accumulated, None
 
-        @jax.checkpoint
-        def process_frame(carry, frame_data):
-            magnitude_chunks = ops.reshape(frame_data, (n_chunks, chunk_size))
-            rf_init = ops.zeros((self.n_tx_samples, self.n_freq_samples, self.n_el_samples, 1), dtype='complex64')
-            rf_accumulated, _ = ops.scan(accumulate_chunks, rf_init, (position_chunks, magnitude_chunks))
-            return carry, rf_accumulated
-
-        _, rf_data = ops.scan(process_frame, None, magnitudes_padded)
+        rf_init = ops.zeros(
+            (n_frames, self.n_tx_samples, self.n_freq_samples, self.n_el_samples, 1),
+            dtype='complex64',
+        )
+        rf_data, _ = ops.scan(accumulate_chunks, rf_init, (position_chunks, magnitude_chunks))
         return rf_data, tx_indices, freq_indices, el_indices
 
     def __str__(self):

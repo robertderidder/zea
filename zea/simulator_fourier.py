@@ -112,7 +112,9 @@ def simulate_rf(
             ``waveform`` is given.
 
     Returns:
-        fourier transform of the RF data of shape (n_tx, n_freq, n_el)
+        fourier transform of the RF data. With 1D ``scatterer_magnitudes`` of shape
+        (n_scat,) the shape is (n_tx, n_freq, n_el, 1); with a batched (n_frames, n_scat)
+        the leading frame axis is preserved: (n_frames, n_tx, n_freq, n_el, 1).
     """
 
     probe_geometry_tx = probe_geometry
@@ -244,10 +246,16 @@ def simulate_rf(
     else:
         cell_response = 1.0
 
-    def _simulate_single_tx(t0_delay_tx, initial_time_tx, tx_apodization_tx):
+    def _kernel_single_tx(t0_delay_tx, initial_time_tx, tx_apodization_tx):
+        # Per-transmit RF response kernel with the scatterer magnitudes factored OUT. The
+        # forward model is linear in `scatterer_magnitudes`, so we build the (constant w.r.t.
+        # the optimization variable) kernel here and apply the magnitudes via a single
+        # contraction below. This lets reverse-mode AD store only this small post-`tx_el`-sum
+        # kernel — not the huge (n_scat, n_tx_el, n_rx, n_freq) intermediate — so the
+        # likelihood gradient costs one kernel build instead of a full forward recompute.
         tau_total = (dist_total / sound_speed) + t0_delay_tx[None, :, None] - initial_time_tx
 
-        result = (
+        kernel = (
             waveform_spectrum[None, None, None]
             * delay2(
                 freqs[None, None, None],
@@ -256,8 +264,7 @@ def simulate_rf(
                 sampling_frequency=sampling_frequency,
             )
             * ops.cast(
-                scatterer_magnitudes[:, None, None, None]
-                * tx_apodization_tx[None, :, None, None]
+                tx_apodization_tx[None, :, None, None]
                 * directivity_tx
                 * directivity_rx
                 * attenuation
@@ -267,12 +274,25 @@ def simulate_rf(
             )
         )
 
-        # Sum over all transmitting elements and scatterers.
-        return ops.sum(result, axis=[0, 1])
+        # Sum over transmitting elements only; keep the scatterer axis for the magnitude
+        # contraction outside. -> (n_scat, n_rx, n_freq)
+        return ops.sum(kernel, axis=1)
 
-    rf_data = vmap(_simulate_single_tx)(t0_delays, initial_times, tx_apodizations)
-    
-    rf_data = ops.transpose(rf_data, (0, 2, 1))[...,None]
+    # (n_tx, n_scat, n_rx, n_freq)
+    kernel = vmap(_kernel_single_tx)(t0_delays, initial_times, tx_apodizations)
+
+    # Linear contraction with the (area-weighted) scatterer magnitudes. `scatterer_magnitudes`
+    # may carry a leading frame batch axis: (n_scat,) -> (n_tx, n_freq, n_rx, 1);
+    # (n_frames, n_scat) -> (n_frames, n_tx, n_freq, n_rx, 1). Complex-safe (per-scatterer
+    # phase is allowed). Summing over n_scat here is mathematically identical to the previous
+    # combined (scat, tx_el) sum — only the reduction order differs.
+    mag = ops.cast(scatterer_magnitudes, "complex64")
+    if len(mag.shape) == 1:
+        rf_data = ops.einsum("s,tsrf->trf", mag, kernel)
+        rf_data = ops.transpose(rf_data, (0, 2, 1))[..., None]
+    else:
+        rf_data = ops.einsum("ns,tsrf->ntrf", mag, kernel)
+        rf_data = ops.transpose(rf_data, (0, 1, 3, 2))[..., None]
     return rf_data
 
 def directivity(f, theta, element_width, sound_speed, rigid_baffle=True):
