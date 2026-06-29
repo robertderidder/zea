@@ -649,12 +649,9 @@ class Parameters(BaseParameters):
             else:
                 subset = np.arange(len(idx))  # If no number is provided, select all focused transmits
             
-            #select evenly spaced transmits from idx
-            self._params["selected_transmits"] = idx[subset].tolist()
-            self._invalidate("selected_transmits")
-            return self
+            return idx[subset].tolist()
 
-        if selection == "diverging":
+        if "diverging" in selection:
             value = self._params.get("focus_distances")
             if value is None:
                 raise ValueError("No focus distances provided, cannot select diverging transmits")
@@ -672,11 +669,9 @@ class Parameters(BaseParameters):
             else:
                 subset = np.arange(len(idx))  # If no number is provided, select all diverging transmits
 
-            self._params["selected_transmits"] = idx[subset].tolist()
-            self._invalidate("selected_transmits")
-            return self
+            return idx[subset].tolist()
 
-        if selection == "plane":
+        if "plane" in selection:
             value = self._params.get("focus_distances")
             if value is None:
                 raise ValueError("No focus distances provided, cannot select plane wave transmits")
@@ -693,9 +688,7 @@ class Parameters(BaseParameters):
                     raise ValueError(f"Invalid plane transmit selection: {selection}")
             else:
                 subset = np.arange(len(idx))  # If no number is provided, select all plane wave transmits
-            self._params["selected_transmits"] = idx[subset].tolist()
-            self._invalidate("selected_transmits")
-            return self
+            return idx[subset].tolist()
 
         # Handle integer - select evenly spaced transmits
         if isinstance(selection, (int, np.integer)):

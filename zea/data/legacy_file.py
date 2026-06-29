@@ -136,6 +136,7 @@ def legacy_scan(scan_parameters: dict):
     scan_parameters = _reformat_waveforms(scan_parameters)
 
     scan_parameters.pop("probe_geometry", None)
+    scan_parameters.pop("lens_correction", None)   # legacy field; now apply_lens_correction in Parameters
     scan_parameters.pop("n_ax", None)
     scan_parameters.pop("n_el", None)
     n_tx = scan_parameters.pop("n_tx", None)
