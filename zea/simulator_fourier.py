@@ -69,6 +69,7 @@ def simulate_rf(
     scatterer_cell_size=None,
     waveform=None,
     waveform_sampling_frequency=None,
+    tgc_gain_curve=None,
 ):
     """
     Simulates a select number of rf_data points in the frequency domain for a given set of scatterers and probe geometry.
@@ -110,6 +111,8 @@ def simulate_rf(
         waveform_sampling_frequency (float, optional): The sampling rate [Hz] of
             ``waveform`` (e.g. 250e6 for Verasonics waveforms). Only used when
             ``waveform`` is given.
+        tgc_gain_curve (array-like, optional): The time-gain compensation curve of shape
+            (n_ax,). If ``None`` (default), no TGC is applied.
 
     Returns:
         fourier transform of the RF data. With 1D ``scatterer_magnitudes`` of shape
@@ -255,6 +258,19 @@ def simulate_rf(
         # likelihood gradient costs one kernel build instead of a full forward recompute.
         tau_total = (dist_total / sound_speed) + t0_delay_tx[None, :, None] - initial_time_tx
 
+        # TGC is a real, frequency-independent gain that depends on receive *time*, not on
+        # depth/frequency per se. Rather than applying it to the composite RF signal (which
+        # would require a time<->frequency round trip, or a full-spectrum circular convolution
+        # that defeats the point of only evaluating a `freq_indices` subset), we exploit that
+        # every scatterer's contribution already has a known arrival time `tau_total`: we look
+        # up the gain at that time directly, exactly like `attenuation`/`spread_atten` below.
+        # This is exact for a delta-like arrival and an excellent approximation for a short
+        # pulse (n_period cycles) against a gain curve that is smooth on that timescale.
+        if tgc_gain_curve is not None:
+            tgc_atten = tgc_gain(tau_total[..., None], tgc_gain_curve, sampling_frequency)
+        else:
+            tgc_atten = 1.0
+
         kernel = (
             waveform_spectrum[None, None, None]
             * delay2(
@@ -269,7 +285,8 @@ def simulate_rf(
                 * directivity_rx
                 * attenuation
                 * spread_atten
-                * cell_response,
+                * cell_response
+                * tgc_atten,
                 "complex64",
             )
         )
@@ -367,6 +384,33 @@ def spread(dist, mindist=1e-4):
     """
     dist = ops.clip(dist, mindist, float("inf"))
     return mindist / dist
+
+
+def tgc_gain(tau, tgc_gain_curve, sampling_frequency):
+    """Looks up the (real-valued, linear) TGC gain at given receive times via interpolation.
+
+    ``tgc_gain_curve[n]`` is defined at sample time ``n / sampling_frequency`` (see
+    :func:`zea.func.ultrasound.make_tgc_curve`), i.e. the same time axis as the simulated RF
+    samples (``delay2`` places a scatterer's response at sample ``tau * sampling_frequency``).
+    Linear interpolation is used since ``tau`` is continuous; times outside the curve's range
+    are clamped to the nearest edge value.
+
+    Args:
+        tau (array-like): Receive times [s], any shape.
+        tgc_gain_curve (array-like): 1D linear-scale TGC gain curve of shape (n_ax,).
+        sampling_frequency (float): Sampling frequency [Hz] of ``tgc_gain_curve``.
+
+    Returns:
+        array-like: The interpolated gain, same shape as ``tau``.
+    """
+    n_samples = ops.shape(tgc_gain_curve)[0]
+    idx = ops.clip(tau * sampling_frequency, 0.0, ops.cast(n_samples - 1, "float32"))
+    idx_floor = ops.cast(ops.floor(idx), "int32")
+    idx_ceil = ops.minimum(idx_floor + 1, n_samples - 1)
+    frac = idx - ops.cast(idx_floor, "float32")
+    gain_floor = ops.take(tgc_gain_curve, idx_floor)
+    gain_ceil = ops.take(tgc_gain_curve, idx_ceil)
+    return gain_floor * (1.0 - frac) + gain_ceil * frac
 
 
 def hann_fd(f, width):

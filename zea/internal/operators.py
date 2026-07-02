@@ -480,6 +480,7 @@ class Simulator(Operator):
                 element_width=self.parameters.element_width,
                 attenuation_coef=self.parameters.attenuation_coef,
                 tx_apodizations=self.parameters.tx_apodizations,
+                tgc_gain_curve = self.parameters.tgc_gain_curve,
                 waveform=self.waveform,
                 waveform_sampling_frequency=self.waveform_sampling_frequency,
             )
@@ -701,6 +702,7 @@ class Simulator_Total(Operator):
                 tx_apodizations=self.parameters.tx_apodizations,
                 waveform=self.waveform,
                 waveform_sampling_frequency=self.waveform_sampling_frequency,
+                tgc_gain_curve=self.parameters.tgc_gain_curve,
             )
 
         # Kept @jax.checkpoint here (unlike Simulator): this operator also optimizes
@@ -1213,8 +1215,9 @@ class Simulator_GD(Operator):
                 element_width=self.parameters.element_width,
                 attenuation_coef=attenuation_coef,
                 tx_apodizations=self.parameters.tx_apodizations,
+                tgc_gain_curve=self.parameters.tgc_gain_curve,
             )
-        
+
         @jax.checkpoint
         def accumulate_chunks(rf_accumulated, chunk):
             scat_chunk, amp_chunk = chunk
