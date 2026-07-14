@@ -407,6 +407,10 @@ class Simulator(Operator):
         return _validate_parameters(parameters)
 
     def image_to_magnitudes(self, image, n_frames):
+        #check for nans
+        if jnp.any(jnp.isnan(image)):
+            log.warning("Image contains NaNs. Replacing with 0.")
+            image = ops.nan_to_num(image, nan=0.0, posinf=1.0, neginf=-1.0)
         assert image.max() < 1.01 and image.min() > -1.01, f"Image values should be in the range [-1, 1]. got (min, max) = ({image.min()}, {image.max()})"
         image = translate(image, range_from=(-1,1), range_to=self.magnitude_range)
         image = ops.reshape(image, (n_frames, -1))
@@ -738,7 +742,7 @@ class Simlator_Time(Operator):
     wavelengths) and ``optvars["sound_speed_offset"]`` (a global sound speed offset).
 
     When ``optvars["position_offset"]`` is all zeros and ``optvars["sound_speed_offset"]``
-    is ``0.0`` (the defaults), this operator produces the same result as `Simulator`.
+    is ``0.0`` (the defaults)+, this operator produces the same result as `Simulator`.
     """
 
     def __init__(self,
