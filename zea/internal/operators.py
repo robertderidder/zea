@@ -407,14 +407,22 @@ class Simulator(Operator):
         return _validate_parameters(parameters)
 
     def image_to_magnitudes(self, image, n_frames):
-        #check for nans
+        # check for nans
         if jnp.any(jnp.isnan(image)):
             log.warning("Image contains NaNs. Replacing with 0.")
             image = ops.nan_to_num(image, nan=0.0, posinf=1.0, neginf=-1.0)
         assert image.max() < 1.01 and image.min() > -1.01, f"Image values should be in the range [-1, 1]. got (min, max) = ({image.min()}, {image.max()})"
+        
+        # Translate to dB range (e.g., [-60, 0])
         image = translate(image, range_from=(-1,1), range_to=self.magnitude_range)
         image = ops.reshape(image, (n_frames, -1))
-        image_lin  = ops.exp(image/20) #Means values between 0 and 6.4.
+        min_db = self.magnitude_range[0]
+        # Convert to linear amplitude and shift the noise floor to exactly 0.0
+        image_lin = ops.power(10.0, image / 20.0) - ops.power(10.0, min_db / 20.0)
+        
+        # Clip tiny negative values that might occur due to floating-point precision
+        image_lin = ops.relu(image_lin)
+            
         return image_lin
 
     def _get_indices(self, seed_el, seed_freq, seed_tx, freq_gaussian_probs):
