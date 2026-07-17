@@ -13,6 +13,7 @@ from zea.data.file import (
     CustomElement,
     File,
     Track,
+    _format_selection,
     _GroupProxy,
     _StringDataset,
     load_file,
@@ -475,6 +476,24 @@ class TestStringDataset:
             np.testing.assert_array_equal(result, seg_labels)
 
 
+class TestFormatSelection:
+    @pytest.mark.parametrize(
+        ("selection", "expected"),
+        [
+            (slice(None), ":"),
+            (slice(1, 5), "1:5"),
+            (slice(None, None, 2), "::2"),
+            (slice(1, 5, 2), "1:5:2"),
+            (Ellipsis, "..."),
+            (0, "0"),
+            ((0, slice(None), slice(1, 5)), "0, :, 1:5"),
+            ((Ellipsis, 0), "..., 0"),
+        ],
+    )
+    def test_formats_selection_as_source_would_read(self, selection, expected):
+        assert _format_selection(selection) == expected
+
+
 class TestGroupProxy:
     def test_attribute_access_returns_dataset(self, spec_file):
         """Datasets come back as ChunkedDataset (concurrent reads), delegating to h5py."""
@@ -516,6 +535,14 @@ class TestGroupProxy:
             proxy = f.data.image
             assert isinstance(proxy, _GroupProxy)
             assert proxy.values.shape == (n_frames, 16, 12, 1)
+
+    def test_slicing_group_raises_helpful_type_error(self, spec_file):
+        """Slicing a group directly (e.g. f.data.envelope_data[:]) should point to '.values'."""
+        path, *_ = spec_file
+
+        with File(path) as f:
+            with pytest.raises(TypeError, match=r"envelope_data\.values\[:\]"):
+                f.data.envelope_data[:]
 
     def test_missing_key_raises_attribute_error(self, spec_file):
         path, *_ = spec_file
