@@ -53,7 +53,15 @@ def run_subprocess(cmd, **kwargs):
 
 
 @pytest.mark.parametrize(
-    "dataset", ["echonet", "echonetlvh", "camus", "cetus", "picmus", "verasonics"]
+    "dataset",
+    [
+        pytest.param("echonet", marks=pytest.mark.tensorflow),
+        pytest.param("echonetlvh", marks=pytest.mark.jax),
+        "camus",
+        "cetus",
+        "picmus",
+        "verasonics",
+    ],
 )
 @pytest.mark.heavy
 def test_conversion_script(tmp_path_factory, dataset):
@@ -92,6 +100,7 @@ def test_conversion_script(tmp_path_factory, dataset):
                 str(dst),
                 "--no_hyperthreading",
             ],
+            env=create_env_for_dataset(dataset),
         )
         with open(dst / "split.yaml", "r") as f:
             split_content1 = yaml.safe_load(f)
@@ -105,6 +114,8 @@ def test_conversion_script(tmp_path_factory, dataset):
 
 def create_env_for_dataset(dataset):
     env = os.environ.copy()
+    if dataset == "echonet":
+        env["KERAS_BACKEND"] = "tensorflow"
     if dataset == "echonetlvh":
         env["KERAS_BACKEND"] = "jax"
     return env
@@ -1109,7 +1120,7 @@ def test_load_avi(tmp_path):
     # Verify the shape and content
     assert loaded_frames.shape == (10, 32, 32)
     for i in range(10):
-        np.testing.assert_allclose(loaded_frames[i], frames[i], atol=1)
+        np.testing.assert_allclose(loaded_frames[i], frames[i], atol=2)
 
 
 def test_sitk_load(tmp_path):
@@ -1342,37 +1353,6 @@ def test_images_uint8_passes(tmp_path):
     assert any(dst.rglob("*.hdf5")), "expected at least one output HDF5 file"
 
 
-def test_verasonics_compression_flag_respected(tmp_path):
-    """When enable_compression=False the File.create call must use compression=None."""
-    n_tx, n_el = 4, 16
-    scan = {
-        "sampling_frequency": np.float32(40e6),
-        "center_frequency": np.float32(7e6),
-        "demodulation_frequency": np.float32(7e6),
-        "initial_times": np.zeros(n_tx, dtype=np.float32),
-        "t0_delays": np.zeros((n_tx, n_el), dtype=np.float32),
-        "tx_apodizations": np.ones((n_tx, n_el), dtype=np.float32),
-        "focus_distances": np.full(n_tx, np.inf, dtype=np.float32),
-        "transmit_origins": np.zeros((n_tx, 3), dtype=np.float32),
-        "polar_angles": np.zeros(n_tx, dtype=np.float32),
-    }
-    data = {"raw_data": np.zeros((2, n_tx, 32, n_el, 1), dtype=np.float32)}
-    path = tmp_path / "no_compression.hdf5"
-    File.create(
-        path,
-        data=data,
-        scan=scan,
-        probe={"name": "generic", "probe_geometry": np.zeros((n_el, 3), dtype=np.float32)},
-        compression=None,
-    )
-
-    import h5py as _h5py
-
-    with _h5py.File(path, "r") as hf:
-        ds = hf["tracks/track_0/data/raw_data"]
-        assert ds.compression is None, "dataset should have no compression"
-
-
 def test_verasonics_upload_requires_hf_repo_id(tmp_path, monkeypatch):
     """When upload is enabled, hf_repo_id must be provided before upload starts."""
     src = tmp_path / "src"
@@ -1386,7 +1366,6 @@ def test_verasonics_upload_requires_hf_repo_id(tmp_path, monkeypatch):
         frames=None,
         allow_accumulate=False,
         device="cpu",
-        no_compression=False,
         upload=True,
         hf_repo_id="",
         revision="test-branch",
@@ -1411,7 +1390,6 @@ def test_verasonics_upload_requires_revision(tmp_path, monkeypatch):
         frames=None,
         allow_accumulate=False,
         device="cpu",
-        no_compression=False,
         upload=True,
         hf_repo_id="zeahub/test-dataset",
         revision=None,

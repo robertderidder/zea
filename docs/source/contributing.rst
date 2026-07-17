@@ -108,11 +108,75 @@ In general, we recommend a test-driven development approach:
 
 2. Write the code to make the test pass.
 
-You can run tests for your installed environment using `pytest <https://docs.pytest.org/en/stable/>`_:
+Tests are divided into three groups:
+
+.. list-table::
+   :widths: 15 85
+   :header-rows: 1
+
+   * - Group
+     - Description
+   * - **light**
+     - Fast unit tests. Run these on every change.
+   * - **heavy**
+     - Resource-intensive tests, requires a GPU.
+   * - **notebook**
+     - Runs notebooks end-to-end, requires a GPU.
+
+**Run the light tests** (what CI runs on every push):
 
 .. code-block:: shell
 
-   pytest
+   pytest -m 'not heavy and not notebook'
+
+When working locally you may not have all ML backends installed. Skip tests that
+require a missing backend with:
+
+.. code-block:: shell
+
+   pytest -m 'not heavy and not notebook' --skip-unavailable-backends
+
+.. dropdown:: Heavy tests
+
+   Heavy tests require significant compute and are best run on a machine with a GPU.
+   They are skipped in the light test run automatically.
+
+   .. code-block:: shell
+
+      pytest -m 'heavy'
+
+.. dropdown:: Notebook tests
+
+   Notebook tests execute every ``.ipynb`` under ``docs/source/notebooks/`` end-to-end
+   using `papermill <https://papermill.readthedocs.io/>`_. They are split into groups
+   matching the CI matrix:
+
+   .. code-block:: shell
+
+      # All notebooks
+      pytest -s -m 'notebook'
+
+      # One subfolder only (agent / models / pipeline / data / metrics)
+      pytest -s -m 'notebook' --notebook-dir agent
+      pytest -s -m 'notebook' --notebook-dir data --notebook-dir metrics
+
+      # A single notebook by name
+      pytest -s -m 'notebook' --notebook dbua_example.ipynb
+
+.. dropdown:: Running a single test or test file
+
+   Pass any pytest node-id to run just one test:
+
+   .. code-block:: shell
+
+      # Single test function
+      pytest tests/test_tensor_ops.py::test_flatten
+
+      # All tests in a file
+      pytest tests/test_tensor_ops.py
+
+      # Match by keyword
+      pytest -k "beamform"
 
 A few things to keep in mind when making changes:
 
@@ -239,7 +303,9 @@ New tutorial or example notebooks are always welcome! Please add them to the
 `docs/source/notebooks <https://github.com/tue-bmd/zea/tree/main/docs/source/notebooks>`_
 directory. Make sure to follow the naming conventions and structure of existing
 notebooks. If you are adding a new tutorial, please also update :doc:`examples`
-to check if your notebook is included.
+to check if your notebook is included. See the `docs README
+<https://github.com/tue-bmd/zea/tree/main/docs#readme>`_ for notebook link
+conventions and how to check the docs for broken links.
 
 Adding to ``zea.models``
 ~~~~~~~~~~~~~~~~~~~~~~~~
