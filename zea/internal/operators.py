@@ -324,7 +324,17 @@ def _sample_indices(n_el, n_freqs, beams, n_tx_samples, n_freq_samples, n_el_sam
     def _uniform_probs(_):
         return ops.ones((n_freqs,), dtype="float32") / n_freqs
 
-    p = jax.lax.cond(ops.cast(freq_gaussian_probs, "bool"), _gaussian_probs, _uniform_probs, None)
+    if getattr(freq_gaussian_probs, "ndim", 0) == 1:
+        # Explicit per-bin sampling probabilities (e.g. proportional to the measured
+        # spectrum's RMS): importance-sample the loss where the data has energy,
+        # instead of the fixed fs/4-centred Gaussian below.
+        assert freq_gaussian_probs.shape[0] == n_freqs, (
+            f"freq probs shape {freq_gaussian_probs.shape} != n_freqs {n_freqs}"
+        )
+        p = ops.cast(freq_gaussian_probs, "float32")
+        p = p / ops.sum(p)
+    else:
+        p = jax.lax.cond(ops.cast(freq_gaussian_probs, "bool"), _gaussian_probs, _uniform_probs, None)
 
     log_probs = ops.log(ops.maximum(p, 1e-10))
     gumbel = -ops.log(-ops.log(keras.random.uniform(shape=(n_freqs,), seed=seed_freq)))
