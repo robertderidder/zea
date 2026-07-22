@@ -137,8 +137,14 @@ def simulate_rf(
         )
 
     if not apply_lens_correction:
-        dist_tx = ops.linalg.norm(probe_geometry_tx[None] - scatterer_positions[:, None], axis=-1)
-        dist_rx = ops.linalg.norm(probe_geometry_rx[None] - scatterer_positions[:, None], axis=-1)
+        # sqrt(sum(x^2) + eps^2) instead of jnp.linalg.norm(x): norm's gradient
+        # x/||x|| is undefined (NaN) exactly at x=0. Not hit by today's grid (closest
+        # scatterer-to-element distance is ~0.1 mm), but position_offset is now a GD
+        # optvar, not a fixed grid, so this is a latent risk rather than a hypothetical
+        # one. eps is far below any physical length scale here (wavelength ~0.1-1 mm).
+        eps = 1e-12
+        dist_tx = ops.sqrt(ops.sum((probe_geometry_tx[None] - scatterer_positions[:, None]) ** 2, axis=-1) + eps ** 2)
+        dist_rx = ops.sqrt(ops.sum((probe_geometry_rx[None] - scatterer_positions[:, None]) ** 2, axis=-1) + eps ** 2)
     else:
         dist_tx = (
             compute_lens_corrected_travel_times(
@@ -176,16 +182,33 @@ def simulate_rf(
     scat_pos_relative_to_probe_rx = scatterer_positions[:, None] - probe_geometry_rx[None]
 
     # Compute 3D directivity terms that are independent of transmit index.
-    theta_tx = ops.arctan2(
+    #
+    # d(atan2(y, x))/d(y, x) = (x, -y) / (x^2 + y^2) is undefined (0/0 -> NaN) exactly
+    # at (y, x) = (0, 0). The FORWARD value is fine (atan2(0, 0) = 0 by convention),
+    # so this was invisible to amplitude-only gradients (the kernel built from these
+    # angles is a forward-only constant there — magnitudes are factored out, see this
+    # function's docstring). It surfaces the moment anything differentiates through
+    # POSITION or sound speed (which the angles depend on via scatterer_positions):
+    # every scatterer on this probe's 2D imaging plane has y = 0 exactly (no
+    # elevation coordinate), and the reconstruction grid's shallowest row sits at
+    # exactly z = 0, so phi_tx/phi_rx hit the singularity for an entire row of
+    # scatterers, poisoning the whole reduction with NaN. `_atan2_safe` nudges the
+    # second argument away from exactly 0 only in that (0, 0) neighbourhood, leaving
+    # every other point (including the legitimate x=0, y!=0 case) untouched.
+    def _atan2_safe(y, x, eps=1e-9):
+        singular = (ops.abs(y) < eps) & (ops.abs(x) < eps)
+        return ops.arctan2(y, ops.where(singular, eps, x))
+
+    theta_tx = _atan2_safe(
         scat_pos_relative_to_probe_tx[:, :, 0], scat_pos_relative_to_probe_tx[:, :, 2]
     )
-    phi_tx = ops.arctan2(
+    phi_tx = _atan2_safe(
         scat_pos_relative_to_probe_tx[:, :, 1], scat_pos_relative_to_probe_tx[:, :, 2]
     )
-    theta_rx = ops.arctan2(
+    theta_rx = _atan2_safe(
         scat_pos_relative_to_probe_rx[:, :, 0], scat_pos_relative_to_probe_rx[:, :, 2]
     )
-    phi_rx = ops.arctan2(
+    phi_rx = _atan2_safe(
         scat_pos_relative_to_probe_rx[:, :, 1], scat_pos_relative_to_probe_rx[:, :, 2]
     )
 

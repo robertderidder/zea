@@ -670,14 +670,24 @@ class Simulator_Total(Operator):
 
         return positions, sound_speed
 
-    def forward(self, image, optvars, seed, freq_gaussian_probs=False, **kwargs):
+    def forward(self, image, optvars, seed, freq_gaussian_probs=False, linearized=False, **kwargs):
         assert isinstance(optvars, dict), "optvars should be a dict"
         positions, sound_speed = self.reparameterize_optvars(optvars)
 
-        assert len(image.shape) == 4, "Image should have shape (B, H, W, C)"
-        image = ops.image.resize(image, self.shape, interpolation="bilinear")
-        n_frames = image.shape[0]
-        magnitudes = self.image_to_magnitudes(image, n_frames)
+        if linearized:
+            # `image` is already a (n_frames, n_scat) array of per-scatterer magnitudes —
+            # skip the resize + image_to_magnitudes mapping. Mirrors Simulator.forward.
+            assert image.ndim == 2, (
+                "linearized=True expects magnitudes of shape (n_frames, n_scat), "
+                f"got {image.shape}"
+            )
+            n_frames = image.shape[0]
+            magnitudes = image
+        else:
+            assert len(image.shape) == 4, "Image should have shape (B, H, W, C)"
+            image = ops.image.resize(image, self.shape, interpolation="bilinear")
+            n_frames = image.shape[0]
+            magnitudes = self.image_to_magnitudes(image, n_frames)
 
         seed_el, seed_freq, seed_tx = split_seed(seed, 3)
         el_indices, freq_indices, tx_indices = _sample_indices(
